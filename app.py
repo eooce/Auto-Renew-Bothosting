@@ -390,7 +390,7 @@ def main():
             current_title = sb.get_title()
             print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-            if "a/billings" in current_url :
+            if current_url == "https://bot-hosting.net/a/billings":
                 login_ok = True
                 print("✅ SESSION_TOKEN 登录成功,当前已到达账单页")
             else:
@@ -409,7 +409,7 @@ def main():
                 current_title = sb.get_title()
                 print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-                if "a/billings" in current_url :
+                if current_url == "https://bot-hosting.net/a/billings":
                     login_ok = True
                     print("✅ Discord OAuth 登录成功,当前已到达账单页")
                 else:
