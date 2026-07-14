@@ -132,7 +132,6 @@ def wait_for_turnstile_pass(sb, timeout=30):
         page_lower = sb.get_page_source().lower()
         if not any(x in page_lower for x in cf_indicators):
             print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
             return True
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
@@ -177,7 +176,6 @@ def extract_expiry_date(page_source: str) -> str:
             if len(date_str.split('/')[-1]) == 4:  # 年份长度4
                 parts = date_str.split('/')
                 if len(parts[0]) == 2:  # 第一部分是2位（月）
-                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
                     return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
     return None
@@ -508,17 +506,38 @@ def main():
                 modal_button_clicked = True
                 print("✅ 已点击续期按钮")
             except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+                print(f"❌ 续期按钮点击失败: {e}")
 
-            print("⏳ 等待新的过期时间...")
-            sb.sleep(6)
+            # ==============================
+            # 重构：强一致性校验与刷新轮询机制
+            # ==============================
+            print("⏳ 等待服务端事务处理并强制刷新获取最新状态...")
+            sb.sleep(5)  # 给予服务端处理续期请求的初始缓冲窗口
+            
+            new_expiry = current_expiry
+            new_page_text = ""
+            new_countdown = None
 
-            # 提取新的到期日期和倒计时
-            new_page_text = sb.get_page_source()
-            new_expiry = extract_expiry_date(new_page_text)
+            # 执行有限轮询强制重载，最高等待约 12-15 秒
+            for attempt in range(1, 5):
+                print(f"🔄 强制重载页面以获取最新数据 (尝试 {attempt}/4)...")
+                sb.refresh()
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                
+                new_page_text = sb.get_page_source()
+                new_expiry = extract_expiry_date(new_page_text)
+                
+                if new_expiry and new_expiry != current_expiry:
+                    print(f"✅ 探测到状态已变更，跳出轮询。")
+                    break
+
             new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
             if new_match:
                 new_countdown = new_match.group(1)
+
+            # 最终断言并通知
+            if new_countdown:
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
                 if new_expiry:
                     print(f"📅 新的到期日期: {new_expiry}")
@@ -540,11 +559,11 @@ def main():
                         )
                     )
                 else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                    print("⚠️ 续期结果未能通过 UI 断言验证，到期日期字面量未变化。可能已达当前续期上限，请手动核查。")
                     send_telegram_message(
                         format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
+                            "⚠️ 续期状态核验失败",
+                            extra="触发强刷新后日期仍未变更，请登录后台检查是否触顶防刷规则",
                             expiry_date=current_expiry or "（未获取到）"
                         )
                     )
