@@ -32,7 +32,7 @@ DISCORD_TOKEN 获取（用于 SESSION_TOKEN 失效后备用登录
 浏览器登录 Discord（网页版）
 按 F12 打开开发者工具 ➡ 网络 ➡ 点击任意频道 ➡ 选择左侧的任意api
 找到名为 authorization字段 的 值，即为discord token,详情如图所示
-https://tc.alex.nyc.mn/api/cfile/AgACAgUAAxkDAAIQDGqSWecr3R_i5PkBqwLlqSffxV_0AAK6D2sbYqyZVLSba2E03K7vAQADAgADeQADPQQ
+[img]https://tc.alex.nyc.mn/api/cfile/AgACAgUAAxkDAAIQDGqSWecr3R_i5PkBqwLlqSffxV_0AAK6D2sbYqyZVLSba2E03K7vAQADAgADeQADPQQ[/img]
 
 作用：当 SESSION_TOKEN 过期导致登录失败时，脚本会自动使用 Discord Token 走 OAuth 流程重新登录，并自动更新 SESSION_TOKEN Secret，实现永久免维护。
 
