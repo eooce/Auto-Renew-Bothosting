@@ -28,7 +28,13 @@
 登录你的账号,按F12或页面空白处 右键➡检查➡选择应用程序或appcations 找到对应的字段点击获取对应的值，详情如图
 <img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/e532b0d6-9f12-45fd-8af9-69e1029a1a92" />
 
+DISCORD_TOKEN 获取（用于 SESSION_TOKEN 失效后备用登录
+浏览器登录 Discord（网页版）
+按 F12 打开开发者工具 ➡ 网络 ➡ 点击任意频道 ➡ 选择左侧的任意api
+找到名为 authorization字段 的 值，即为discord token,详情如图所示
+https://tc.alex.nyc.mn/api/cfile/AgACAgUAAxkDAAIQDGqSWecr3R_i5PkBqwLlqSffxV_0AAK6D2sbYqyZVLSba2E03K7vAQADAgADeQADPQQ
 
+作用：当 SESSION_TOKEN 过期导致登录失败时，脚本会自动使用 Discord Token 走 OAuth 流程重新登录，并自动更新 SESSION_TOKEN Secret，实现永久免维护。
 
 ### 获取 `GH_TOKEN`(GitHub Personal Access Token)
 1：点击GitHub 账户右上角头像 → Settings（设置）。
