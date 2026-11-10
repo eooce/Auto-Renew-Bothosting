@@ -516,33 +516,20 @@ def main():
                 modal_button_clicked = True
                 print("✅ 已点击续期按钮")
             except Exception as e:
-                print(f"❌ 续期按钮点击失败: {e}")
+                print(f"续期按钮点击失败: {e}")
 
-            # 验证续期结果: 轮询刷新账单页, 直到出现续期冷却倒计时或到期日期延后
-            print("⏳ 等待验证续期结果...")
-            new_expiry = None
-            new_countdown = None
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                sb.sleep(6)
-                try:
-                    new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
-                except Exception:
-                    new_page_text = sb.get_page_source()
-                new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
-                match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
-                if match:
-                    new_countdown = match.group(1)
-                    break
-                if new_expiry and new_expiry != current_expiry:
-                    break
-                try:
-                    sb.open(f"{BASE_URL}/a/billings")
-                    sb.wait_for_ready_state_complete()
-                except Exception:
-                    pass
+            print("⏳ 等待新的过期时间...")
+            sb.sleep(6)
 
-            if new_countdown:
+            # 提取新的到期日期和倒计时
+            try:
+                new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
+            except Exception:
+                new_page_text = sb.get_page_source()
+            new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
+            new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
+            if new_match:
+                new_countdown = new_match.group(1)
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
                 if new_expiry:
                     print(f"📅 新的到期日期: {new_expiry}")
@@ -553,27 +540,25 @@ def main():
                         expiry_date=new_expiry or "（未获取到）"
                     )
                 )
-            elif new_expiry and new_expiry != current_expiry:
-                print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
-                send_moviepilot_message(
-                    format_notification(
-                        "✅ 续期成功",
-                        extra="到期日期已更新",
-                        expiry_date=new_expiry
-                    )
-                )
             else:
-                # 续期结果只有成功/失败两种: 未确认到成功即判定为失败
-                reason = ("弹窗续期按钮点击失败" if not modal_button_clicked
-                          else "点击确认后账单页未出现续期冷却倒计时，且到期日期未变化")
-                print(f"❌ 续期失败: {reason}")
-                send_moviepilot_message(
-                    format_notification(
-                        "❌ 续期失败",
-                        error=reason,
-                        expiry_date=current_expiry or "（未获取到）"
+                if new_expiry and new_expiry != current_expiry:
+                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+                    send_moviepilot_message(
+                        format_notification(
+                            "✅ 续期成功",
+                            extra="到期日期已更新",
+                            expiry_date=new_expiry
+                        )
                     )
-                )
+                else:
+                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                    send_moviepilot_message(
+                        format_notification(
+                            "⚠️ 续期可能未成功",
+                            extra="请登录后台检查",
+                            expiry_date=current_expiry or "（未获取到）"
+                        )
+                    )
 
         else:
             if countdown_text:
