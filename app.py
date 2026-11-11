@@ -4,31 +4,31 @@
 import os, re, sys, time, random, requests, subprocess,ctypes
 from seleniumbase import SB
 
-# 环境变量配置(可以直接私库在双引号里填写)
-EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱必填，登录和通知使用
-PASSWORD      = os.environ.get("PASSWORD") or ""        # 主用密码登录方式, 失败时才使用,必须填写
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
+# Environment variable configuration (values can be entered in double quotes in a private repository)
+EMAIL         = os.environ.get("EMAIL") or ""           # Required email for sign-in and notifications
+PASSWORD      = os.environ.get("PASSWORD") or ""        # Primary password sign-in method; required
+TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # Telegram chat ID; leave blank to disable notifications; requires the bot token
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
 
 BASE_URL = "https://bot-hosting.net"
 
 if not (EMAIL and PASSWORD):
-    print("ℹ️ 未配置 EMAIL 和 PASSWORD,脚本终止。")
+    print("ℹ️ EMAIL and PASSWORD are not configured; exiting.")
     sys.exit(1)
 
-# 发送tg通知
+# Send Telegram notifications
 def send_telegram_message(message: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置，跳过通知")
+        print("⚠️ Telegram is not configured; skipping notification.")
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
-        print("✅ Telegram 通知已发送")
+        print("✅ Telegram notification sent.")
     except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+        print(f"❌ Failed to send Telegram notification: {e}")
 
-# 通知格式
+# Notification format
 def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
@@ -42,21 +42,21 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
         masked_email = EMAIL[:2] + '****' 
     
     lines = [
-        "🇫🇮 Bot-hosting 续期通知",
+        "🇫🇮 Bot-hosting Renewal Notification",
         "",
         f"{status}",
-        f"👤 登录账户: {masked_email}",
+        f"👤 Account: {masked_email}",
     ]
     if expiry_date:
-        lines.append(f"📅 到期时间: {expiry_date}")
+        lines.append(f"📅 Expiration date: {expiry_date}")
     if extra:
         lines.append(extra)
     if error:
-        lines.append(f"⚠️ 错误信息: {error}")
-    lines.append(f"⏱️ 登录时间: {now}")
+        lines.append(f"⚠️ Error: {error}")
+    lines.append(f"⏱️ Sign-in time: {now}")
     return "\n".join(lines)
 
-# ---------- 基础工具 ----------
+# ---------- Basic utilities ----------
 def js(sb, script, default=None, errors=None):
     try:
         result = sb.execute_script(script)
@@ -72,7 +72,7 @@ def js(sb, script, default=None, errors=None):
                 errors.append(f"cdp.evaluate: {type(e2).__name__}: {e2}")
             return default
 
-# Turnstile 定位失败时的现场诊断快照
+# Diagnostic snapshot when Turnstile cannot be located
 def diag_turnstile_dom(sb, errors=None):
     snap = js(sb, """
         var out = [];
@@ -98,8 +98,8 @@ def diag_turnstile_dom(sb, errors=None):
         for err in errors:
             print("   [diag][exec-error] " + str(err)[:200])
 
-#  页面注入脚本
-# Turnstile token（官方 JS 接口 或 表单隐藏域），未通过时为空串
+# Page-injected script
+# Turnstile token (official JS interface or hidden form field); an empty string if not passed
 TURNSTILE_TOKEN_JS = """
 try { if (window.turnstile && window.turnstile.getResponse) {
         var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
@@ -145,7 +145,7 @@ var hr = hit.getBoundingClientRect();
 return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
 """
 
-# Turnstile 脚本异步渲染，轮询等待组件出现
+# Turnstile renders asynchronously; poll until the component appears
 def wait_turnstile_present(sb, timeout=12):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -211,7 +211,7 @@ def _click_turnstile(sb, locate_timeout=10) -> bool:
             break
         time.sleep(1)
     if not coords:
-        print("⚠️ 无法定位 Turnstile 坐标, 打印现场诊断:")
+        print("⚠️ Unable to locate Turnstile coordinates; printing diagnostics:")
         diag_turnstile_dom(sb, errors)
         return False
 
@@ -223,12 +223,12 @@ def _click_turnstile(sb, locate_timeout=10) -> bool:
         bar = int(parts[2] or 800) - int(parts[3] or 768)
         ax = int(coords["cx"]) + sx
         ay = int(coords["cy"]) + sy + bar
-        print(f"🖱️ 底层点击 Turnstile ({ax}, {ay})")
+        print(f"🖱️ Low-level click on Turnstile at ({ax}, {ay})")
         _xdotool_click(ax, ay)
         time.sleep(3)
         return True
     except Exception as e:
-        print(f"⚠️ 底层点击失败: {e}")
+        print(f"⚠️ Low-level click failed: {e}")
         return False
 
 def click_turnstile(sb) -> bool:
@@ -238,19 +238,19 @@ def click_turnstile(sb) -> bool:
     if coords:
         try:
             if hasattr(sb, "cdp") and hasattr(sb.cdp, "gui_click_x_y"):
-                print(f"🖱️ 坐标点击 Turnstile ({coords['cx']},{coords['cy']})")
+                print(f"🖱️ Clicking Turnstile at coordinates ({coords['cx']},{coords['cy']})")
                 sb.cdp.gui_click_x_y(int(coords["cx"]), int(coords["cy"]))
                 return True
         except Exception as e:
-            print(f"⚠️ 坐标点击失败: {e}")
+            print(f"⚠️ Coordinate click failed: {e}")
     try:
         if hasattr(sb, "cdp") and hasattr(sb.cdp, "click_captcha"):
-            print("🖱️ 兜底调用cdp点击 ...")
+            print("🖱️ Falling back to a CDP click...")
             sb.cdp.click_captcha()
             return True
-        print("⚠️ 当前 SeleniumBase 版本无 sb.cdp.click_captcha")
+        print("⚠️ This SeleniumBase version does not provide sb.cdp.click_captcha")
     except Exception as e:
-        print(f"⚠️ click_captcha 出错: {e}")
+        print(f"⚠️ click_captcha error: {e}")
     return False
 
 def solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8) -> bool:
@@ -262,23 +262,23 @@ def solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8) -> bool:
     clicks = 0
     while time.time() < deadline:
         if turnstile_token(sb):
-            print(f"✅ {tag}已通过(已获取 token)")
+            print(f"✅ {tag} passed (token obtained)")
             return True
         if time.time() >= next_click:
             clicks += 1
-            print(f"🖱️ 第 {clicks} 次点击 Turnstile 验证框...")
+            print(f"🖱️ Click {clicks} on the Turnstile verification box...")
             click_turnstile(sb)
             next_click = time.time() + 10 + random.uniform(0, 3)
         time.sleep(2)
     ok = bool(turnstile_token(sb))
-    print(f"{'✅' if ok else '❌'} {tag}{'已通过' if ok else '未通过'}")
+    print(f"{'✅' if ok else '❌'} {tag}{' passed' if ok else ' failed'}")
     return ok
 
 def handle_turnstile(sb) -> bool:
-    print("🛡️ 处理 Turnstile 验证...")
+    print("🛡️ Handling Turnstile verification...")
     return solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8)
     
-# 获取当前出口ip
+# Get the current public IP
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
     if proxy_server:
@@ -287,7 +287,7 @@ def get_current_ip(proxy_server: str = "") -> str:
     response.raise_for_status()
     return response.text.strip()
 
-# 时间格式化
+# Format time
 def format_countdown(countdown_str: str) -> str:
     try:
         h, m, _ = countdown_str.split(':')
@@ -300,7 +300,7 @@ def format_countdown(countdown_str: str) -> str:
     except:
         return countdown_str
 
-# 归一化日期为 YYYY/MM/DD
+# Normalize the date to YYYY/MM/DD
 def normalize_date(date_str: str) -> str:
     parts = date_str.split('/')
     if len(parts) == 3:
@@ -312,11 +312,11 @@ def normalize_date(date_str: str) -> str:
 
 DATE_RE = r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
 
-# 获取过期日期
+# Get the expiration date
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
         r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE,   # Expires 10/24/2026. Renew manually to extend it for 4 days.
-        DATE_RE,                                # 兜底: 账单页纯文本中通常只有到期日期
+        DATE_RE,                                # Fallback: the billing page's plain text usually contains only the expiration date
     ]
     for pattern in patterns:
         match = re.search(pattern, page_source)
@@ -324,7 +324,7 @@ def extract_expiry_date(page_source: str) -> str:
             return normalize_date(match.group(1))
     return None
 
-# 优先从 DOM 的 st-meta 元素提取到期日期 (不依赖页面语言)
+# Prefer extracting the expiration date from the DOM's st-meta element (independent of page language)
 def get_expiry_from_dom(sb) -> str:
     for selector in ['span.st-meta', '.st-meta', '[class*="st-meta"]']:
         try:
@@ -336,10 +336,54 @@ def get_expiry_from_dom(sb) -> str:
             pass
     return None
 
-# 主流程
+# ---------- Sign-in with Turnstile (login page) ----------
+def ensure_email_form(sb):
+    # The login page may already show the email form; only click "Continue with email" if the input is missing
+    if not sb.is_element_visible('input[type="email"]'):
+        sb.click('button[type="submit"]')
+        sb.sleep(8)
+    sb.wait_for_element_visible('input[type="email"]', timeout=20)
+
+def password_login_once(sb) -> bool:
+    sb.open(f"{BASE_URL}/login")
+    sb.wait_for_ready_state_complete()
+    sb.sleep(3)
+    ensure_email_form(sb)
+    print("📧 Entering email...")
+    sb.input('input[type="email"]', EMAIL)
+    sb.sleep(1)
+    print("🔑 Entering password...")
+    sb.input('input[type="password"]', PASSWORD)
+    sb.sleep(3)
+
+    # Same Turnstile handler as the renewal dialog; submit only after a token exists
+    if wait_turnstile_present(sb):
+        if not handle_turnstile(sb):
+            print("❌ Turnstile not passed on the sign-in page")
+            return False
+    else:
+        print("ℹ️ Turnstile not detected")
+    sb.sleep(1)
+
+    sb.click('button[type="submit"]')
+    print("🖱️ Submitting sign-in")
+    sb.sleep(6)
+    sb.wait_for_ready_state_complete()
+    sb.open(f"{BASE_URL}/a/billings")
+    sb.wait_for_ready_state_complete()
+    sb.sleep(3)
+    current_url = sb.get_current_url()
+    print(f"📝 Current URL: {current_url}, Title: {sb.get_title()}")
+    if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+        print("✅ Password sign-in succeeded; reached the billing page")
+        return True
+    print(f"❌ Password sign-in did not reach the billing page; current URL: {current_url}")
+    return False
+
+# Main flow
 def main():
     print("#" * 25)
-    print("   Bot-hosting 自动续期")
+    print("   Bot-hosting Auto-Renewal")
     print("#" * 25)
 
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -349,73 +393,39 @@ def main():
     sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
 
     if IS_PROXY:
-        print(f"🔗 挂载代理: {PROXY_SERVER}")
+        print(f"🔗 Using proxy: {PROXY_SERVER}")
         sb_kwargs["proxy"] = PROXY_SERVER
     else:
-        print("🍭 未使用代理，直连访问")
+        print("🍭 No proxy in use; connecting directly")
 
     with SB(**sb_kwargs) as sb:
         try:
             ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
-            print(f"📍 当前出口IP: {ip}")
+            print(f"📍 Current public IP: {ip}")
         except Exception as e:
-            print(f"⚠️ 获取出口 IP 失败: {e}")
+            print(f"⚠️ Failed to get public IP: {e}")
 
         login_ok = False
 
-        # 账号密码登录（密码不过期，唯一登录方式；整段兜异常，失败只标记 login_ok=False 走统一失败通知）
+        # Sign in with email and password; retry once with a fresh page load if Turnstile or sign-in fails
         if EMAIL and PASSWORD:
-            print("🚀 启动浏览器...")
-            try:
-                print(f"🌐 访问 {BASE_URL}/login")
-                sb.open(f"{BASE_URL}/login")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
-                sb.click('button[type="submit"]') # 点击 Continue with email 按钮
-                sb.sleep(12)  # 等待页面加载
-                print(f"📧 填写邮箱...")
-                sb.input('input[type="email"]', EMAIL)
-                sb.sleep(1)
-                print(f"🔑 填写密码...")
-                sb.input('input[type="password"]', PASSWORD)
-                sb.sleep(3)
-
-                if wait_turnstile_present(sb):
-                    if not handle_turnstile(sb):
-                        print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
-                        try:
-                            sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
-                            sb.sleep(4)
-                        except Exception as e:
-                            print(f"⚠️ 兜底点击失败: {e}")
-                        # sb.save_screenshot("turnstile_failed.png")
-                else:
-                    print("ℹ️ 未检测到 Turnstile")
-                sb.sleep(1)
-                sb.click('button[type="submit"]') # 点击登录按钮
-                print("🖱️ 提交登录按钮")
-                sb.sleep(6)  # 等待页面加载
-                sb.wait_for_ready_state_complete()
-                sb.open(f"{BASE_URL}/a/billings")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
-                current_url = sb.get_current_url()
-                current_title = sb.get_title()
-                print(f"📝 当前URL: {current_url}, Title: {current_title}")
-
-                if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
-                    login_ok = True
-                    print("✅ Password 登录成功,当前已到达账单页")
-                else:
-                    print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
-            except Exception as e:
-                    print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
+            print("🚀 Starting browser...")
+            for attempt in range(1, 3):
+                print(f"🔁 Sign-in attempt {attempt}/2")
+                try:
+                    login_ok = password_login_once(sb)
+                except Exception as e:
+                    print(f"❌ Error during password sign-in: {type(e).__name__}: {str(e)[:150]}")
+                    login_ok = False
+                if login_ok:
+                    break
+                sb.sleep(5)
 
         if not login_ok:
-            send_telegram_message(format_notification("❌ 登录失败", error="Password 登录失败"))
+            send_telegram_message(format_notification("❌ Sign-in failed", error="Password sign-in failed"))
             return
 
-        # 提取当前到期日期
+        # Extract the current expiration date
         sb.sleep(3)
         try:
             page_source = sb.get_page_text() + "\n" + sb.get_page_source()
@@ -423,11 +433,11 @@ def main():
             page_source = sb.get_page_source()
         current_expiry = get_expiry_from_dom(sb) or extract_expiry_date(page_source)
         if current_expiry:
-            print(f"📅 当前到期日期: {current_expiry}")
+            print(f"📅 Current expiration date: {current_expiry}")
         else:
-            print("⚠️ 未能提取当前到期日期")
+            print("⚠️ Could not extract the current expiration date")
 
-        # 寻找外部续期按钮
+        # Find the outer renewal button
         outer_renew_selector = None
         countdown_text = None
         possible_selectors = [
@@ -442,54 +452,54 @@ def main():
             try:
                 if sb.is_element_visible(selector):
                     button_text = sb.get_text(selector)
-                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" 都表示冷却中, 时间为距可续期的剩余时长
+                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" both indicate a cooldown; the time is the remaining wait until renewal is available
                     match = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", button_text, re.I)
                     if match:
                         countdown_text = match.group(1)
-                        print(f"⏳ 续期冷却中, 未到续期时间: '{button_text}'")
+                        print(f"⏳ Renewal cooldown active; renewal is not available yet: '{button_text}'")
                         break
                     elif "Renew" in button_text:
                         outer_renew_selector = selector
-                        print(f"✅ 续期按钮可用: '{button_text}'")
+                        print(f"✅ Renewal button is available: '{button_text}'")
                         break
             except Exception as e:
                 pass
 
-        # 点击外部续期按钮等待弹窗
+        # Click the outer renewal button and wait for the modal
         if outer_renew_selector:
-            print("🔄 点击外部续期按钮，等待验证窗口...")
+            print("🔄 Clicking the outer renewal button; waiting for the verification dialog...")
             try:
                 sb.sleep(2)
                 sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
+                sb.sleep(15)  # Wait for the modal to load; network conditions may cause delays
             except Exception as e:
-                print(f"❌ 点击外部按钮失败: {e}")
-                send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
+                print(f"❌ Failed to click the outer button: {e}")
+                send_telegram_message(format_notification("❌ Renewal failed", error="Error clicking the outer renewal button"))
                 return
 
-            # 处理弹窗中的 Turnstile
-            turnstile_passed = True  # 未检测到 Turnstile 时视为无需验证
+            # Handle Turnstile in the modal
+            turnstile_passed = True  # If Turnstile is not detected, no verification is needed
             if wait_turnstile_present(sb):
                 turnstile_passed = handle_turnstile(sb)
                 if not turnstile_passed:
-                    print("❌ Turnstile 验证失败，尝试兜底点击...")
+                    print("❌ Turnstile verification failed; trying a fallback click...")
                     try:
-                        sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
+                        sb.cdp.click_captcha()  # Try clicking Turnstile verification again
                         sb.sleep(4)
                         turnstile_passed = bool(turnstile_token(sb))
                     except Exception as e:
-                        print(f"⚠️ 兜底点击失败: {e}")
+                        print(f"⚠️ Fallback click failed: {e}")
                     # sb.save_screenshot("turnstile_failed.png")
             else:
-                print("ℹ️ 未检测到 Turnstile")
+                print("ℹ️ Turnstile not detected")
 
             if not turnstile_passed:
-                print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
+                print("❌ Turnstile verification ultimately failed; exiting")
+                send_telegram_message(format_notification("❌ Renewal failed", error="Turnstile verification failed"))
                 return
 
-            # 点击续期按钮
-            print("⏳ 等待续期按钮可用并点击...")
+            # Click the renewal button
+            print("⏳ Waiting for the renewal button to become available...")
             time.sleep(5) 
 
             modal_button_clicked = False
@@ -497,14 +507,14 @@ def main():
                 selector = 'div[role="dialog"] button.btn-primary' 
                 sb.click(selector, timeout=8)
                 modal_button_clicked = True
-                print("✅ 已点击续期按钮")
+                print("✅ Clicked the renewal button")
             except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+                print(f"Failed to click the renewal button: {e}")
 
-            print("⏳ 等待新的过期时间...")
+            print("⏳ Waiting for the updated expiration date...")
             sb.sleep(6)
 
-            # 提取新的到期日期和倒计时
+            # Extract the new expiration date and countdown
             try:
                 new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
             except Exception:
@@ -513,58 +523,58 @@ def main():
             new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
             if new_match:
                 new_countdown = new_match.group(1)
-                print(f"✅ 续期成功！新的倒计时: {new_countdown}")
+                print(f"✅ Renewal succeeded! New countdown: {new_countdown}")
                 if new_expiry:
-                    print(f"📅 新的到期日期: {new_expiry}")
+                    print(f"📅 New expiration date: {new_expiry}")
                 send_telegram_message(
                     format_notification(
-                        "✅ 续期成功",
-                        extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
-                        expiry_date=new_expiry or "（未获取到）"
+                        "✅ Renewal succeeded",
+                        extra=f"⏱️ Time until renewal is available: {format_countdown(new_countdown)}",
+                        expiry_date=new_expiry or "(not available)"
                     )
                 )
             else:
                 if new_expiry and new_expiry != current_expiry:
-                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+                    print(f"✅ Renewal succeeded; expiration date updated to: {new_expiry}")
                     send_telegram_message(
                         format_notification(
-                            "✅ 续期成功",
-                            extra="到期日期已更新",
+                            "✅ Renewal succeeded",
+                            extra="Expiration date updated",
                             expiry_date=new_expiry
                         )
                     )
                 else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                    print("⚠️ Renewal result is unknown; expiration date has not changed. Please check manually.")
                     send_telegram_message(
                         format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
+                            "⚠️ Renewal may have failed",
+                            extra="Please sign in to the control panel and check.",
+                            expiry_date=current_expiry or "(not available)"
                         )
                     )
 
         else:
             if countdown_text:
                 friendly = format_countdown(countdown_text)
-                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
+                print(f"⏳ Renewal is not available yet; countdown: {countdown_text} ({friendly})")
                 send_telegram_message(
                     format_notification(
-                        "⏳ 未到续期时间",
-                        extra=f"⏱️ 可续期时间: {friendly}后",
-                        expiry_date=current_expiry or "（未获取到）"
+                        "⏳ Renewal is not available yet",
+                        extra=f"⏱️ Time until renewal is available: {friendly}",
+                        expiry_date=current_expiry or "(not available)"
                     )
                 )
             else:
-                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
+                print("ℹ️ No renewal button or countdown found; status is unknown")
                 send_telegram_message(
                     format_notification(
-                        "ℹ️ 无需续期",
-                        extra="当前状态未知，请手动检查",
-                        expiry_date=current_expiry or "（未获取到）"
+                        "ℹ️ No renewal needed",
+                        extra="Current status is unknown; please check manually.",
+                        expiry_date=current_expiry or "(not available)"
                     )
                 )
 
-        print("🏁 脚本执行完毕")
+        print("🏁 Script execution complete")
 
 if __name__ == "__main__":
     main()
