@@ -435,11 +435,9 @@ def main():
         outer_renew_selector = None
         countdown_text = None
         possible_selectors = [
-            'button:contains("Renew")',
+            'type:button("Renew free plan")',
             'button:contains("Renew free plan")',
-            'a:contains("Renew")',
-            '[class*="renew"]',
-            '[class*="Renew"]',
+            '[class*="btn btn-primary btn-sm"]',
         ]
 
         for selector in possible_selectors:
