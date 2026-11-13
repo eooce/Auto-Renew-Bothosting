@@ -11,7 +11,8 @@ jobs:
 
     env:
       # 可选: 外部住宅代理(b2proxy 等), 格式 user:pass@host:port 或 http://user:pass@host:port
-      # 配置后优先使用它, 不再启动 sing-box; 粘性会话建议 >= 30 分钟
+      # 只用于最后提交续期请求; 登录和 Turnstile 由直连浏览器完成(住宅代理下 Turnstile 加载不出来)
+      # 粘性会话建议 >= 30 分钟
       RESIDENTIAL_PROXY: ${{ secrets.RESIDENTIAL_PROXY }}
     permissions:
       actions: write
@@ -29,15 +30,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install seleniumbase requests
+          pip install seleniumbase requests curl_cffi
           seleniumbase install chromedriver
 
       - name: 🌐 启用外部住宅代理 (可选)
         if: env.RESIDENTIAL_PROXY != ''
         run: |
-          echo "IS_PROXY=true" >> "$GITHUB_ENV"
-          echo "PROXY_SERVER=$RESIDENTIAL_PROXY" >> "$GITHUB_ENV"
-          echo "✅ 已启用外部住宅代理(优先于 sing-box)"
+          echo "SUBMIT_PROXY=$RESIDENTIAL_PROXY" >> "$GITHUB_ENV"
+          echo "✅ 已配置住宅代理: 浏览器直连登录, 仅续期提交走住宅代理"
 
       - name: ⚙ 设置代理 (sing-box)
         if: env.RESIDENTIAL_PROXY == ''

@@ -1030,6 +1030,65 @@ def find_outer_renew_button(sb):
             continue
     return None, None, None
 
+# ---------- 方案 A: 浏览器直连取 token, 仅续期提交走住宅代理 ----------
+# Chrome 的代理只能在启动时固定, 无法按请求切换; 而住宅代理下 Cloudflare 的 Turnstile 加载不出来。
+# 所以登录/过验证用直连浏览器, 最后那一次 POST 交给 Python 经住宅代理发出。
+SUBMIT_PROXY_URL = ""     # 归一化后的 Python 代理地址
+SUBMIT_PROXY_DISPLAY = ""
+
+def get_browser_cookies(sb) -> dict:
+    """取浏览器里的 bot-hosting 会话 cookie；剔除与出口 IP 绑定的 Cloudflare cookie"""
+    try:
+        jar = sb.driver.get_cookies() or []
+    except Exception as e:
+        print(f"⚠️ 读取浏览器 cookie 失败: {e}")
+        return {}
+    skip = {"__cf_bm", "cf_clearance", "__cfruid", "_cfuvid"}
+    cookies = {}
+    for c in jar:
+        name = str(c.get("name") or "")
+        domain = str(c.get("domain") or "")
+        if not name or name in skip:
+            continue
+        if "bot-hosting" in domain:
+            cookies[name] = c.get("value")
+    return cookies
+
+def submit_renewal_request(sb, token: str):
+    """代替浏览器向 /api/billing/renew-free 发 POST，返回 (状态码, 响应体, 客户端)"""
+    url = f"{BASE_URL}/api/billing/renew-free"
+    cookies = get_browser_cookies(sb)
+    ua = str(js(sb, "return navigator.userAgent;", "") or "")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/dash/billings",
+        "User-Agent": ua,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    payload = json.dumps({"turnstileToken": token})
+    proxies = {"http": SUBMIT_PROXY_URL, "https": SUBMIT_PROXY_URL}
+    print(f"📤 经住宅代理提交续期 (token {len(token)} 字符, cookie {len(cookies)} 个)...")
+    try:
+        from curl_cffi import requests as cf_requests
+    except ImportError:
+        cf_requests = None
+    if cf_requests is not None:
+        try:
+            # Chrome TLS 指纹, 服务端看到的请求特征与浏览器一致
+            resp = cf_requests.post(url, data=payload, headers=headers, cookies=cookies,
+                                    proxies=proxies, impersonate="chrome", timeout=40)
+            return resp.status_code, resp.text, "curl_cffi"
+        except Exception as e:
+            print(f"⚠️ curl_cffi 提交失败, 回退 requests: {type(e).__name__}: {e}")
+    try:
+        resp = requests.post(url, data=payload, headers=headers, cookies=cookies,
+                             proxies=proxies, timeout=40)
+        return resp.status_code, resp.text, "requests"
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}", "requests"
+
 def attempt_renewal(sb, current_expiry: str) -> dict:
     """执行一次续期：点入口按钮 -> 过 Turnstile -> 点确认 -> 等请求 -> 复核结果"""
     state, button_text, selector = find_outer_renew_button(sb)
@@ -1091,9 +1150,6 @@ def attempt_renewal(sb, current_expiry: str) -> dict:
                 "reason": "弹窗内未找到可用的续期确认按钮",
                 "evidence": {"feedback": feedback, "dialog_html": latest_state.get("html", "")}}
 
-    mark = int(js(sb, "window.__renewMark = (window.__renewNet || []).length; "
-                      "return window.__renewMark;", 0) or 0)
-
     # 模拟真人读完提示再操作：随机停留 + 轻微滚动 + 鼠标移动
     sb.sleep(random.uniform(2.0, 4.5))
     try:
@@ -1104,6 +1160,36 @@ def attempt_renewal(sb, current_expiry: str) -> dict:
         pass
     js(sb, "window.scrollBy(0, " + str(random.randint(10, 60)) + "); return 1;", 1)
     sb.sleep(random.uniform(0.3, 0.8))
+
+    if SUBMIT_PROXY_URL:
+        # 方案 A: 不再点确认按钮(那样会从机房 IP 发出)，改为 Python 经住宅代理提交同一 token
+        token = turnstile_token(sb)
+        if not token:
+            feedback = get_visible_feedback(sb)
+            return {"ok": False, "expiry": current_expiry, "countdown": "",
+                    "reason": "Turnstile 已通过但未取到 token，无法提交",
+                    "evidence": {"feedback": feedback}}
+        status, body, via = submit_renewal_request(sb, token)
+        print(f"📤 续期接口响应[{via}]: HTTP {status} {body[:400]}")
+        feedback = get_visible_feedback(sb)
+        if feedback:
+            print(f"💬 提交后页面提示: {feedback}")
+        evidence = {"submit_via": via, "req_status": status,
+                    "req_body": body[:1000], "feedback": feedback}
+        sb.sleep(2)
+        ok, new_expiry, countdown, reason = confirm_renewal_result(sb, current_expiry, timeout=60)
+        if ok:
+            return {"ok": True, "expiry": new_expiry, "countdown": countdown,
+                    "reason": reason, "evidence": evidence}
+        if looks_like_success_response(status, body):
+            return {"ok": True, "expiry": new_expiry or current_expiry, "countdown": "",
+                    "reason": f"续期接口返回 HTTP {status}，服务端已接受", "evidence": evidence}
+        return {"ok": False, "expiry": new_expiry, "countdown": "",
+                "reason": f"住宅代理提交续期失败 HTTP {status}: {body[:200]}",
+                "evidence": evidence}
+
+    mark = int(js(sb, "window.__renewMark = (window.__renewNet || []).length; "
+                      "return window.__renewMark;", 0) or 0)
 
     point = js(sb, SCROLL_CONFIRM_BTN_JS, None)
     clicked = False
@@ -1214,6 +1300,7 @@ def save_debug_artifacts(sb, tag: str, evidence=None):
 
 # 主流程
 def main():
+    global SUBMIT_PROXY_URL, SUBMIT_PROXY_DISPLAY
     print("#" * 25)
     print("   Bot-hosting 自动续期")
     print("#" * 25)
@@ -1225,6 +1312,16 @@ def main():
     SB_PROXY, PROXY_URL, PROXY_DISPLAY = normalize_proxy(PROXY_RAW)
     IS_PROXY = IS_PROXY and bool(SB_PROXY)
     HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
+
+    # 方案 A: 浏览器保持直连(否则 Turnstile 加载不出来), 只有续期那一 POST 走住宅代理
+    _, SUBMIT_PROXY_URL, SUBMIT_PROXY_DISPLAY = normalize_proxy(
+        os.environ.get("SUBMIT_PROXY", "").strip())
+    if SUBMIT_PROXY_URL:
+        print(f"📤 仅续期提交使用住宅代理: {SUBMIT_PROXY_DISPLAY}（浏览器保持直连）")
+        try:
+            print(f"📍 住宅代理出口IP: {get_current_ip(SUBMIT_PROXY_URL)}")
+        except Exception as e:
+            print(f"⚠️ 住宅代理出口IP获取失败: {type(e).__name__}: {e}")
 
     sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
 
