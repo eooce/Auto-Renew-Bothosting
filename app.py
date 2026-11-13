@@ -116,6 +116,104 @@ def diag_turnstile_dom(sb, errors=None):
         for err in errors:
             print("   [diag][exec-error] " + str(err)[:200])
 
+# 在页面里加载 Turnstile api.js，判断当前线路能否访问 challenges.cloudflare.com
+TS_PROBE_JS = """
+if (typeof window.turnstile !== 'undefined') return 'ok';
+window.__tsProbe = window.__tsProbe || 'pending';
+if (!document.getElementById('__tsProbe')) {
+    var s = document.createElement('script');
+    s.id = '__tsProbe';
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    s.onload = function () { window.__tsProbe = 'ok'; };
+    s.onerror = function () { window.__tsProbe = 'error'; };
+    document.head.appendChild(s);
+}
+return window.__tsProbe;
+"""
+
+def probe_turnstile_script(sb, timeout=15) -> str:
+    deadline = time.time() + timeout
+    state = "pending"
+    while time.time() < deadline:
+        state = js(sb, TS_PROBE_JS, "pending")
+        if state in ("ok", "error"):
+            break
+        time.sleep(1)
+    state = str(state or "pending")
+    if state == "ok":
+        print("✅ 浏览器内 Turnstile 脚本可加载(线路可访问 challenges.cloudflare.com)")
+    elif state == "error":
+        print("❌ 浏览器内 Turnstile 脚本加载失败: 当前线路无法访问 challenges.cloudflare.com")
+    else:
+        print(f"⚠️ 浏览器内 Turnstile 脚本 {timeout} 秒未加载完成(线路过慢或被拦截)")
+    return state
+
+# 用 Python 预下载 api.js 后直接注入页面，绕过住宅代理下浏览器内极慢的脚本加载
+TURNSTILE_API_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+_turnstile_api_code = ""
+
+def preload_turnstile_api(proxy_url: str = "") -> str:
+    global _turnstile_api_code
+    if _turnstile_api_code:
+        return _turnstile_api_code
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"}
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    resp = requests.get(TURNSTILE_API_URL, proxies=proxies, headers=headers, timeout=30)
+    resp.raise_for_status()
+    if len(resp.text) < 1000:
+        raise RuntimeError(f"api.js 内容异常({len(resp.text)} bytes)")
+    _turnstile_api_code = resp.text
+    print(f"📦 已预下载 Turnstile api.js ({len(resp.text)} bytes)")
+    return _turnstile_api_code
+
+def ensure_turnstile_api(sb, proxy_url: str = "") -> bool:
+    if js(sb, "return typeof window.turnstile !== 'undefined';", False):
+        print("✅ Turnstile API 已就绪")
+        return True
+    try:
+        code = preload_turnstile_api(proxy_url)
+    except Exception as e:
+        print(f"⚠️ 预下载 Turnstile api.js 失败: {type(e).__name__}: {e}")
+        return False
+    # 直接在当前页面上下文执行(CSP 不拦截 execute_script)
+    try:
+        js(sb, code + "\n;return 1;", 0)
+    except Exception as e:
+        print(f"⚠️ 执行 Turnstile api.js 失败: {e}")
+    if js(sb, "return typeof window.turnstile !== 'undefined';", False):
+        print("✅ Turnstile API 已注入(直接执行)")
+        return True
+    # 兜底: 内联 script 注入
+    try:
+        js(sb, "var s=document.createElement('script');s.text=" + json.dumps(code) +
+               ";document.head.appendChild(s);return 1;", 0)
+    except Exception as e:
+        print(f"⚠️ 内联注入 Turnstile api.js 失败: {e}")
+    ready = js(sb, "return typeof window.turnstile !== 'undefined';", False)
+    print(f"{'✅' if ready else '❌'} Turnstile API 注入结果: window.turnstile="
+          f"{'defined' if ready else 'undefined'}")
+    return bool(ready)
+
+# 拦截广告/统计域名: 它们经住宅代理会长时间占用连接，拖慢 Turnstile 等关键资源加载
+TRACKER_URL_PATTERNS = [
+    "*analytics.google.com*",
+    "*google-analytics.com*",
+    "*googletagmanager.com*",
+    "*googlesyndication.com*",
+    "*googleadservices.com*",
+    "*doubleclick.net*",
+    "*adservice.google.com*",
+]
+
+def block_tracking_domains(sb):
+    try:
+        sb.driver.execute_cdp_cmd("Network.enable", {})
+        sb.driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": TRACKER_URL_PATTERNS})
+        print("🚫 已拦截广告/统计域名(减少代理连接占用)")
+    except Exception as e:
+        print(f"⚠️ 拦截广告/统计域名失败: {e}")
+
 #  页面注入脚本
 # 可见弹窗定位辅助（登录页没有弹窗时返回 null）
 DIALOG_HELPERS_JS = """
@@ -576,6 +674,41 @@ def solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8) -> bool:
 def handle_turnstile(sb) -> bool:
     print("🛡️ 处理 Turnstile 验证...")
     return solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8)
+
+# 登录页 Turnstile: 等待渲染并处理; 长时间未出现时判断线路能否加载 Cloudflare 脚本
+def handle_login_turnstile(sb, wait_timeout=40) -> bool:
+    # Turnstile 由 api.js 异步渲染, 走住宅代理时首次加载明显更慢
+    if wait_turnstile_present(sb, timeout=wait_timeout):
+        return handle_turnstile(sb)
+    print(f"ℹ️ {wait_timeout} 秒内未检测到 Turnstile, 打印现场诊断")
+    diag_turnstile_dom(sb)
+    state = probe_turnstile_script(sb)
+    if state == "ok":
+        print("⏳ Turnstile 脚本可加载, 再等待组件渲染 20 秒...")
+        if wait_turnstile_present(sb, timeout=20):
+            return handle_turnstile(sb)
+    print("⚠️ 登录页 Turnstile 不可用, 前端会拦截登录请求")
+    return False
+
+# 打开登录页 -> 预注入 Turnstile API -> Continue with email -> 填写邮箱密码(供失败重试复用)
+def open_login_form(sb, proxy_url: str = ""):
+    print(f"🌐 访问 {BASE_URL}/login")
+    sb.open(f"{BASE_URL}/login")
+    sb.wait_for_ready_state_complete()
+    sb.sleep(3)
+    ensure_turnstile_api(sb, proxy_url)  # 提前注入 api.js, 避免组件挂载时脚本还没下载完
+    sb.click('button[type="submit"]')  # 点击 Continue with email 按钮
+    try:
+        sb.wait_for_element('input[type="email"]', timeout=25)
+    except Exception:
+        print("⚠️ 25 秒内未出现邮箱输入框, 继续尝试填写")
+    sb.sleep(2)
+    print("📧 填写邮箱...")
+    sb.input('input[type="email"]', EMAIL)
+    sb.sleep(1)
+    print("🔑 填写密码...")
+    sb.input('input[type="password"]', PASSWORD)
+    sb.sleep(3)
     
 # 获取当前出口ip
 def get_current_ip(proxy_server: str = "") -> str:
@@ -1102,6 +1235,7 @@ def main():
         print("🍭 未使用代理，直连访问")
 
     with SB(**sb_kwargs) as sb:
+        block_tracking_domains(sb)
         try:
             ip = get_current_ip(PROXY_URL if IS_PROXY else "")
             print(f"📍 当前出口IP: {ip}")
@@ -1109,40 +1243,43 @@ def main():
             print(f"⚠️ 获取出口 IP 失败: {e}")
 
         login_ok = False
+        login_fail_reason = "Password 登录失败"
 
         # 账号密码登录（密码不过期，唯一登录方式；整段兜异常，失败只标记 login_ok=False 走统一失败通知）
         if EMAIL and PASSWORD:
             print("🚀 启动浏览器...")
             try:
-                print(f"🌐 访问 {BASE_URL}/login")
-                sb.open(f"{BASE_URL}/login")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
-                sb.click('button[type="submit"]') # 点击 Continue with email 按钮
-                sb.sleep(12)  # 等待页面加载
-                print(f"📧 填写邮箱...")
-                sb.input('input[type="email"]', EMAIL)
-                sb.sleep(1)
-                print(f"🔑 填写密码...")
-                sb.input('input[type="password"]', PASSWORD)
-                sb.sleep(3)
+                open_login_form(sb, PROXY_URL if IS_PROXY else "")
 
-                if wait_turnstile_present(sb):
-                    if not handle_turnstile(sb):
-                        print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
-                        try:
-                            sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
-                            sb.sleep(4)
-                        except Exception as e:
-                            print(f"⚠️ 兜底点击失败: {e}")
-                        # sb.save_screenshot("turnstile_failed.png")
-                else:
-                    print("ℹ️ 未检测到 Turnstile")
-                sb.sleep(1)
-                sb.click('button[type="submit"]') # 点击登录按钮
+                if not handle_login_turnstile(sb):
+                    print("🔄 重新加载登录页再试一次(排除首次加载慢/脚本加载失败)...")
+                    open_login_form(sb, PROXY_URL if IS_PROXY else "")
+                    if not handle_login_turnstile(sb, wait_timeout=25):
+                        print("❌ 登录界面 Turnstile 仍未就绪，跳过提交(前端会拦截登录)")
+                        save_debug_artifacts(sb, "login_turnstile", {"note": "login turnstile missing"})
+
+                if not turnstile_token(sb):
+                    raise RuntimeError("登录页 Turnstile 未获取到 token，未提交登录请求")
+
+                sb.sleep(random.uniform(1.0, 2.0))
                 print("🖱️ 提交登录按钮")
-                sb.sleep(6)  # 等待页面加载
+                sb.click('button[type="submit"]')  # 点击登录按钮
+
+                # 等登录请求落地/跳转，避免固定 sleep 打断请求
+                for _ in range(25):
+                    sb.sleep(1)
+                    try:
+                        cur = sb.get_current_url()
+                    except Exception:
+                        continue
+                    if "/login" not in cur or "error=" in cur:
+                        break
                 sb.wait_for_ready_state_complete()
+
+                page_err = get_visible_feedback(sb)
+                if page_err:
+                    print(f"🧾 [login] 页面提示: {page_err}")
+
                 sb.open(f"{BASE_URL}/dash/billings")
                 sb.wait_for_ready_state_complete()
                 sb.sleep(3)
@@ -1154,12 +1291,14 @@ def main():
                     login_ok = True
                     print("✅ Password 登录成功,当前已到达账单页")
                 else:
-                    print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
+                    login_fail_reason = f"Password 登录后仍未到达账单页: {current_url}"
+                    print(f"❌ {login_fail_reason}")
             except Exception as e:
-                    print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
+                    login_fail_reason = f"{type(e).__name__}: {str(e)[:150]}"
+                    print(f"❌ Password 登录过程异常: {login_fail_reason}")
 
         if not login_ok:
-            send_moviepilot_message(format_notification("❌ 登录失败", error="Password 登录失败"))
+            send_moviepilot_message(format_notification("❌ 登录失败", error=login_fail_reason))
             return
 
         # 提取当前到期日期
