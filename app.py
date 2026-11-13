@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, re, sys, time, random, json, requests, subprocess,ctypes
+from urllib.parse import quote
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
@@ -280,11 +281,21 @@ if (__origFetch) {
         var method = String(init.method || (input && input.method) || 'GET').toUpperCase();
         var p = __origFetch.apply(this, arguments);
         if (method !== 'GET' && __interesting(url)) {
-            var entry = {kind: 'fetch', method: method, url: String(url), status: null, body: null, t: Date.now()};
+            var entry = {kind: 'fetch', method: method, url: String(url), status: null,
+                         body: null, reqBody: null, reqHeaders: null, respHeaders: null, t: Date.now()};
+            try {
+                if (init.body != null) entry.reqBody = String(init.body).slice(0, 1000);
+                if (init.headers) entry.reqHeaders = JSON.stringify(init.headers).slice(0, 1000);
+            } catch (e) {}
             window.__renewNet.push(entry);
             try {
                 p.then(function (resp) {
                     entry.status = resp.status;
+                    try {
+                        var hs = [];
+                        resp.headers.forEach(function (v, k) { hs.push(k + ': ' + v); });
+                        entry.respHeaders = hs.join('; ').slice(0, 1000);
+                    } catch (e) {}
                     try { resp.clone().text().then(function (t) {
                         entry.body = String(t || '').slice(0, 3000);
                     }).catch(function () {}); } catch (e) {}
@@ -297,13 +308,25 @@ if (__origFetch) {
 }
 var __origOpen = XMLHttpRequest.prototype.open;
 var __origSend = XMLHttpRequest.prototype.send;
+var __origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+XMLHttpRequest.prototype.setRequestHeader = function (key, value) {
+    if (this.__netEntry) {
+        this.__netEntry.reqHeaders = (this.__netEntry.reqHeaders ? this.__netEntry.reqHeaders + '; ' : '')
+                                     + key + ': ' + value;
+    }
+    return __origSetHeader.apply(this, arguments);
+};
 XMLHttpRequest.prototype.open = function (method, url) {
     this.__netEntry = {kind: 'xhr', method: String(method || 'GET').toUpperCase(),
-                       url: String(url || ''), status: null, body: null, t: Date.now()};
+                       url: String(url || ''), status: null, body: null, reqBody: null,
+                       reqHeaders: null, respHeaders: null, t: Date.now()};
     return __origOpen.apply(this, arguments);
 };
-XMLHttpRequest.prototype.send = function () {
+XMLHttpRequest.prototype.send = function (body) {
     var self = this, entry = this.__netEntry;
+    if (entry) {
+        try { if (body != null) entry.reqBody = String(body).slice(0, 1000); } catch (e) {}
+    }
     if (entry && entry.method !== 'GET' && __interesting(entry.url)) {
         window.__renewNet.push(entry);
         this.addEventListener('load', function () {
@@ -346,6 +369,34 @@ for (var i = 0; i < all.length; i++) {
 return best ? best.innerText : '';
 """
 
+# 浏览器环境指纹，用于判断服务端是否按自动化特征拒绝续期
+FINGERPRINT_JS = """
+var out = {};
+try {
+    out.ua = navigator.userAgent;
+    out.webdriver = navigator.webdriver;
+    out.languages = (navigator.languages || []).join(',');
+    out.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    out.screen = screen.width + 'x' + screen.height;
+    out.outer = window.outerWidth + 'x' + window.outerHeight;
+    out.inner = window.innerWidth + 'x' + window.innerHeight;
+    out.cores = navigator.hardwareConcurrency;
+    out.plugins = navigator.plugins.length;
+    var gl = document.createElement('canvas').getContext('webgl');
+    var dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    out.webglVendor = dbg ? String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)) : '';
+    out.webglRenderer = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : '';
+    var names = [];
+    document.cookie.split(';').forEach(function (c) {
+        var n = c.split('=')[0].trim();
+        if (n) names.push(n);
+    });
+    out.cookies = names.join(',');
+    out.cfClearance = names.indexOf('cf_clearance') >= 0;
+} catch (e) { out.error = String(e); }
+return JSON.stringify(out);
+"""
+
 # Turnstile 脚本异步渲染，轮询等待组件出现
 def wait_turnstile_present(sb, timeout=12):
     deadline = time.time() + timeout
@@ -385,6 +436,36 @@ def _windows_mouse_click(x: int, y: int):
     except Exception:
         pass
 
+def _mouse_position():
+    try:
+        r = subprocess.run(["xdotool", "getmouselocation", "--shell"],
+                           capture_output=True, text=True, timeout=3)
+        values = {}
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                key, val = line.split("=", 1)
+                values[key] = val
+        return int(values.get("X", 0)), int(values.get("Y", 0))
+    except Exception:
+        return None
+
+def _human_mouse_move(x: int, y: int):
+    """分多段移动鼠标，避免坐标瞬移这种明显的非人类轨迹"""
+    start = _mouse_position()
+    if not start:
+        subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)],
+                       timeout=3, stderr=subprocess.DEVNULL)
+        return
+    sx, sy = start
+    steps = random.randint(4, 7)
+    for i in range(1, steps + 1):
+        t = i / steps
+        mx = int(sx + (x - sx) * t + random.uniform(-8, 8))
+        my = int(sy + (y - sy) * t + random.uniform(-8, 8))
+        subprocess.run(["xdotool", "mousemove", str(mx), str(my)],
+                       timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(random.uniform(0.06, 0.18))
+
 def _xdotool_click(x: int, y: int):
     if os.name == "nt":
         _windows_mouse_click(x, y)
@@ -392,8 +473,8 @@ def _xdotool_click(x: int, y: int):
 
     _activate_window()
     try:
-        subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=3, stderr=subprocess.DEVNULL)
-        time.sleep(0.15)
+        _human_mouse_move(x, y)
+        time.sleep(random.uniform(0.2, 0.6))
         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
@@ -406,6 +487,15 @@ def _screen_point(sb, cx, cy):
     sx, sy = int(parts[0] or 0), int(parts[1] or 0)
     bar = int(parts[2] or 800) - int(parts[3] or 768)
     return int(cx) + sx, int(cy) + sy + bar
+
+def _move_mouse_screen(x, y):
+    if os.name == "nt":
+        try:
+            ctypes.windll.user32.SetCursorPos(int(x), int(y))
+        except Exception:
+            pass
+        return
+    _human_mouse_move(int(x), int(y))
 
 def _click_viewport_point(sb, cx, cy, label="元素") -> bool:
     try:
@@ -495,6 +585,42 @@ def get_current_ip(proxy_server: str = "") -> str:
     response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
     response.raise_for_status()
     return response.text.strip()
+
+# 代理地址归一化，兼容:
+#   http://user:pass@host:port / user:pass@host:port / host:port:user:pass / host:port / socks5://host:port
+# 返回 (SeleniumBase 代理, requests 代理, 展示文本)
+def normalize_proxy(raw: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return "", "", ""
+    scheme = "http"
+    rest = raw
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+    scheme = scheme.lower()
+    user = pwd = ""
+    if "@" in rest:
+        cred, rest = rest.rsplit("@", 1)
+        user, _, pwd = cred.partition(":")
+    elif rest.count(":") == 3:  # b2proxy 导出的 host:port:user:pass
+        host, port, user, pwd = rest.split(":", 3)
+        rest = f"{host}:{port}"
+
+    if scheme.startswith("socks"):
+        if user:
+            print("⚠️ Chrome 不支持 SOCKS5 认证, 请改用代理商提供的 HTTP 端口")
+        sb_proxy = f"{scheme}://{rest}"
+    elif user:
+        sb_proxy = f"{user}:{pwd}@{rest}"
+    else:
+        sb_proxy = rest
+
+    req_proxy = f"{scheme}://"
+    if user:
+        req_proxy += f"{quote(user, safe='')}:{quote(pwd, safe='')}@"
+    req_proxy += rest
+    display = f"{scheme}://{rest}" + (f" (用户: {user})" if user else "")
+    return sb_proxy, req_proxy, display
 
 # 时间格式化（兼容 HH:MM:SS、HH:MM 和 "3d 4h 5m" 等写法）
 def format_countdown(countdown_str: str) -> str:
@@ -683,6 +809,12 @@ def print_net_entries(entries: list, tag: str = "续期请求"):
     for entry in entries[-20:]:
         print(f"   - [{entry.get('kind')}] {entry.get('method')} {entry.get('url')} "
               f"-> {entry.get('status')} body={(entry.get('body') or '')[:400]}")
+        if entry.get("reqBody"):
+            print(f"     请求体: {str(entry.get('reqBody'))[:400]}")
+        if entry.get("reqHeaders"):
+            print(f"     请求头: {str(entry.get('reqHeaders'))[:400]}")
+        if entry.get("respHeaders"):
+            print(f"     响应头: {str(entry.get('respHeaders'))[:400]}")
         if entry.get("error"):
             print(f"     error={entry.get('error')}")
 
@@ -705,6 +837,26 @@ def wait_renew_request(sb, since: int = 0, timeout: int = 45, require_status: bo
 
 def get_visible_feedback(sb) -> str:
     return str(js(sb, FEEDBACK_JS, "") or "")
+
+def print_fingerprint(sb):
+    """打印关键浏览器指纹，便于判断服务端是否按自动化特征拒绝"""
+    raw = js(sb, FINGERPRINT_JS, "{}")
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    print("🧬 浏览器环境: "
+          f"webdriver={data.get('webdriver')} tz={data.get('timezone')} "
+          f"lang={data.get('languages')} screen={data.get('screen')} "
+          f"window={data.get('outer')} inner={data.get('inner')} "
+          f"cores={data.get('cores')} plugins={data.get('plugins')}")
+    print("🧬 WebGL: "
+          f"{data.get('webglVendor') or '未知'} / {data.get('webglRenderer') or '未知'} "
+          f"cf_clearance={data.get('cfClearance')} "
+          f"cookies={data.get('cookies') or '无'}")
+    print(f"🧬 UA: {data.get('ua') or '未知'}")
 
 def looks_like_success_response(status, body: str) -> bool:
     try:
@@ -808,6 +960,17 @@ def attempt_renewal(sb, current_expiry: str) -> dict:
 
     mark = int(js(sb, "window.__renewMark = (window.__renewNet || []).length; "
                       "return window.__renewMark;", 0) or 0)
+
+    # 模拟真人读完提示再操作：随机停留 + 轻微滚动 + 鼠标移动
+    sb.sleep(random.uniform(2.0, 4.5))
+    try:
+        jx, jy = _screen_point(sb, random.randint(200, 900), random.randint(120, 620))
+        _move_mouse_screen(jx, jy)
+        sb.sleep(random.uniform(0.3, 0.9))
+    except Exception:
+        pass
+    js(sb, "window.scrollBy(0, " + str(random.randint(10, 60)) + "); return 1;", 1)
+    sb.sleep(random.uniform(0.3, 0.8))
 
     point = js(sb, SCROLL_CONFIRM_BTN_JS, None)
     clicked = False
@@ -923,20 +1086,24 @@ def main():
     print("#" * 25)
 
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    PROXY_RAW = os.environ.get("PROXY_SERVER", "").strip()
+    if IS_PROXY and not PROXY_RAW:
+        PROXY_RAW = "socks5://127.0.0.1:1080"  # 未显式配置时使用本地 sing-box
+    SB_PROXY, PROXY_URL, PROXY_DISPLAY = normalize_proxy(PROXY_RAW)
+    IS_PROXY = IS_PROXY and bool(SB_PROXY)
     HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
 
     sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
 
     if IS_PROXY:
-        print(f"🔗 挂载代理: {PROXY_SERVER}")
-        sb_kwargs["proxy"] = PROXY_SERVER
+        print(f"🔗 挂载代理: {PROXY_DISPLAY}")
+        sb_kwargs["proxy"] = SB_PROXY
     else:
         print("🍭 未使用代理，直连访问")
 
     with SB(**sb_kwargs) as sb:
         try:
-            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+            ip = get_current_ip(PROXY_URL if IS_PROXY else "")
             print(f"📍 当前出口IP: {ip}")
         except Exception as e:
             print(f"⚠️ 获取出口 IP 失败: {e}")
@@ -1007,6 +1174,9 @@ def main():
         else:
             print("⚠️ 未能提取当前到期日期")
 
+        # 先记录一次浏览器环境，便于判断续期被拒是否与自动化特征有关
+        print_fingerprint(sb)
+
         # 续期：定位入口按钮 -> 过 Turnstile -> 点确认 -> 等待请求 -> 复核结果，失败自动重试一次
         result = None
         for attempt in range(1, 3):
@@ -1024,6 +1194,7 @@ def main():
             if result.get("ok"):
                 break
             print(f"⚠️ 第 {attempt} 次续期未成功: {result.get('reason')}")
+            print_fingerprint(sb)
             save_debug_artifacts(sb, f"attempt{attempt}", result.get("evidence"))
 
         if result and result.get("ok"):

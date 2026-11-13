@@ -8,6 +8,11 @@ on:
 jobs:
   Renew-bot:
     runs-on: ubuntu-24.04
+
+    env:
+      # 可选: 外部住宅代理(b2proxy 等), 格式 user:pass@host:port 或 http://user:pass@host:port
+      # 配置后优先使用它, 不再启动 sing-box; 粘性会话建议 >= 30 分钟
+      RESIDENTIAL_PROXY: ${{ secrets.RESIDENTIAL_PROXY }}
     permissions:
       actions: write
       contents: read
@@ -27,7 +32,15 @@ jobs:
           pip install seleniumbase requests
           seleniumbase install chromedriver
 
+      - name: 🌐 启用外部住宅代理 (可选)
+        if: env.RESIDENTIAL_PROXY != ''
+        run: |
+          echo "IS_PROXY=true" >> "$GITHUB_ENV"
+          echo "PROXY_SERVER=$RESIDENTIAL_PROXY" >> "$GITHUB_ENV"
+          echo "✅ 已启用外部住宅代理(优先于 sing-box)"
+
       - name: ⚙ 设置代理 (sing-box)
+        if: env.RESIDENTIAL_PROXY == ''
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
