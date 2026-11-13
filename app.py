@@ -7,8 +7,14 @@ from seleniumbase import SB
 # 环境变量配置(可以直接私库在双引号里填写)
 EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱必填，登录和通知使用
 PASSWORD      = os.environ.get("PASSWORD") or ""        # 主用密码登录方式, 失败时才使用,必须填写
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+MP_URL        = (os.environ.get("MP_URL") or "").strip()  # MoviePilot 域名/地址, 未写协议时默认 https://
+MP_APIKEY     = os.environ.get("MP_APIKEY") or ""       # MoviePilot UrlNotify 插件的 apikey
+MP_CHANNEL    = os.environ.get("MP_CHANNEL") or ""      # 可选, 指定通知渠道(Wechat/Feishu/Telegram 等), 不填使用插件默认
+MP_MTYPE      = os.environ.get("MP_MTYPE") or ""        # 可选, 指定消息类型, 不填使用插件默认
+
+if MP_URL and not MP_URL.startswith(("http://", "https://")):
+    MP_URL = "https://" + MP_URL
+MP_URL = MP_URL.rstrip("/")
 
 BASE_URL = "https://bot-hosting.net"
 
@@ -16,17 +22,28 @@ if not (EMAIL and PASSWORD):
     print("ℹ️ 未配置 EMAIL 和 PASSWORD,脚本终止。")
     sys.exit(1)
 
-# 发送tg通知
-def send_telegram_message(message: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置，跳过通知")
+# 发送通知(经 MoviePilot UrlNotify 插件转发到企业微信)
+def send_moviepilot_message(message: str):
+    if not MP_URL or not MP_APIKEY:
+        print("⚠️ MoviePilot 通知未配置(MP_URL/MP_APIKEY)，跳过通知")
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"{MP_URL}/api/v1/plugin/UrlNotify/send"
+    params = {"apikey": MP_APIKEY}
+    if MP_CHANNEL:
+        params["channel"] = MP_CHANNEL
+    if MP_MTYPE:
+        params["mtype"] = MP_MTYPE
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
-        print("✅ Telegram 通知已发送")
+        resp = requests.post(
+            url,
+            params=params,
+            json={"title": "Bot-hosting 续期通知", "text": message},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        print(f"✅ MoviePilot 通知已发送: {resp.text[:200]}")
     except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+        print(f"❌ MoviePilot 通知发送失败: {e}")
 
 # 通知格式
 def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
@@ -340,6 +357,36 @@ def get_expiry_from_dom(sb) -> str:
             pass
     return None
 
+# 点击确认后轮询账单页，确认续期是否真的生效（只返回成功或失败，不再输出“可能未成功”）
+# 返回 (是否成功, 最新到期日, 冷却倒计时, 说明)
+def confirm_renewal_result(sb, current_expiry: str, timeout: int = 60) -> tuple:
+    deadline = time.time() + timeout
+    last_expiry = current_expiry
+    while True:
+        sb.sleep(3)
+        try:
+            # 带时间戳重新打开账单页，避开前端缓存
+            sb.open(f"{BASE_URL}/dash/billings?_r={int(time.time())}")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(2)
+        except Exception as e:
+            print(f"⚠️ 刷新账单页失败: {e}")
+        try:
+            text = sb.get_page_text() + "\n" + sb.get_page_source()
+        except Exception:
+            text = sb.get_page_source()
+        latest = get_expiry_from_dom(sb) or extract_expiry_date(text)
+        if latest:
+            last_expiry = latest
+        match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", text)
+        if match:
+            return True, last_expiry, match.group(1), "账单页已出现下次可续期倒计时"
+        if current_expiry and latest and latest != current_expiry:
+            return True, last_expiry, "", f"到期时间已更新（{current_expiry} → {latest}）"
+        if time.time() >= deadline:
+            return False, last_expiry, "", f"{timeout} 秒内账单页未出现续期倒计时，到期时间也未变化"
+        sb.sleep(4)
+
 # 主流程
 def main():
     print("#" * 25)
@@ -416,7 +463,7 @@ def main():
                     print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
 
         if not login_ok:
-            send_telegram_message(format_notification("❌ 登录失败", error="Password 登录失败"))
+            send_moviepilot_message(format_notification("❌ 登录失败", error="Password 登录失败"))
             return
 
         # 提取当前到期日期
@@ -466,7 +513,7 @@ def main():
                 sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
-                send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
+                send_moviepilot_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
 
             # 处理弹窗中的 Turnstile
@@ -487,7 +534,7 @@ def main():
 
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
+                send_moviepilot_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
             # 点击续期按钮
@@ -503,68 +550,65 @@ def main():
             except Exception as e:
                 print(f"续期按钮点击失败: {e}")
 
+            if not modal_button_clicked:
+                print("❌ 未点击到弹窗确认按钮，判定续期失败")
+                send_moviepilot_message(
+                    format_notification(
+                        "❌ 续期失败",
+                        error="未点击到弹窗确认按钮",
+                        expiry_date=current_expiry or "（未获取到）"
+                    )
+                )
+                return
+
+            print("⏳ 等待新的过期时间...")
             sb.sleep(5)
             sb.refresh()
-            print("⏳ 等待新的过期时间...")
             sb.wait_for_ready_state_complete()
             sb.sleep(3)
 
-            # 提取新的到期日期和倒计时
-            try:
-                new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
-            except Exception:
-                new_page_text = sb.get_page_source()
-            new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
-            new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
-            if new_match:
-                new_countdown = new_match.group(1)
-                print(f"✅ 续期成功！新的倒计时: {new_countdown}")
-                if new_expiry:
-                    print(f"📅 新的到期日期: {new_expiry}")
-                send_telegram_message(
+            renew_ok, new_expiry, new_countdown, reason = confirm_renewal_result(sb, current_expiry)
+            if renew_ok:
+                print(f"✅ 续期成功（{reason}）")
+                if new_countdown:
+                    extra = f"⏱️ 可续期时间: {format_countdown(new_countdown)}后"
+                else:
+                    extra = reason
+                send_moviepilot_message(
                     format_notification(
                         "✅ 续期成功",
-                        extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
+                        extra=extra,
                         expiry_date=new_expiry or "（未获取到）"
                     )
                 )
             else:
-                if new_expiry and new_expiry != current_expiry:
-                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
-                    send_telegram_message(
-                        format_notification(
-                            "✅ 续期成功",
-                            extra="到期日期已更新",
-                            expiry_date=new_expiry
-                        )
+                print(f"❌ 续期失败（{reason}）")
+                send_moviepilot_message(
+                    format_notification(
+                        "❌ 续期失败",
+                        error=reason,
+                        expiry_date=new_expiry or "（未获取到）"
                     )
-                else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
-                    send_telegram_message(
-                        format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
-                        )
-                    )
+                )
 
         else:
             if countdown_text:
                 friendly = format_countdown(countdown_text)
-                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-                send_telegram_message(
+                # 冷却中说明本期已经续期过，按成功告知
+                print(f"✅ 本期已续期（冷却中，{friendly} 后可再次续期）")
+                send_moviepilot_message(
                     format_notification(
-                        "⏳ 未到续期时间",
-                        extra=f"⏱️ 可续期时间: {friendly}后",
+                        "✅ 续期成功",
+                        extra=f"本期已续期，{friendly}后可再次续期",
                         expiry_date=current_expiry or "（未获取到）"
                     )
                 )
             else:
-                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
-                send_telegram_message(
+                print("❌ 未找到续期按钮或倒计时，判定续期失败")
+                send_moviepilot_message(
                     format_notification(
-                        "ℹ️ 无需续期",
-                        extra="当前状态未知，请手动检查",
+                        "❌ 续期失败",
+                        error="未找到续期按钮，请检查账号状态或页面结构",
                         expiry_date=current_expiry or "（未获取到）"
                     )
                 )

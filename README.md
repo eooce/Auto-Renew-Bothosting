@@ -17,8 +17,12 @@
 | EMAIL              | ✅ 必填  | 登录和通知使用的Email,必须填写                          |
 | PASSWORD           | ✅ 必填  | 登录密码,必填,在控制台右上角头像里去设置                 |
 | NODE_LINK          | ❌ 可选  | 代理链接（如 vless:// vmess:// trojan:// hysteria2:// tuic:// anytls:// socks5:// )|
-| TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
-| TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）              |
+| MP_URL             | ❌ 可选  | MoviePilot 访问地址，如 `mp.example.com`（不写协议默认走 https），需与 MP_APIKEY 一起配置 |
+| MP_APIKEY          | ❌ 可选  | MoviePilot UrlNotify 插件的 apikey（用于发送通知）                 |
+| MP_CHANNEL         | ❌ 可选  | 通知渠道（Wechat/Feishu/Telegram/Slack 等），不填则使用插件默认配置    |
+| MP_MTYPE           | ❌ 可选  | 消息类型（如 Plugin），不填则使用插件默认配置                        |
+
+> 通知通过 MoviePilot 的 `/api/v1/plugin/UrlNotify/send` 接口发送，默认由插件侧转发到企业微信。
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
