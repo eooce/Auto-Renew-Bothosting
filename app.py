@@ -503,8 +503,11 @@ def main():
             except Exception as e:
                 print(f"续期按钮点击失败: {e}")
 
+            sb.sleep(5)
+            sb.refresh()
             print("⏳ 等待新的过期时间...")
-            sb.sleep(6)
+            sb.wait_for_ready_state_complete()
+            sb.sleep(3)
 
             # 提取新的到期日期和倒计时
             try:
