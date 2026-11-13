@@ -45,7 +45,19 @@ jobs:
           MP_CHANNEL: ${{ secrets.MP_CHANNEL }}
           MP_MTYPE: ${{ secrets.MP_MTYPE }}
         run: |
-          xvfb-run --auto-servernum python3 app.py
+          set -o pipefail
+          xvfb-run --auto-servernum python3 app.py 2>&1 | tee renew_run.log
+
+      - name: 📤 上传续期诊断日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-debug
+          path: |
+            renew_run.log
+            renew_debug_*
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 🧽 清理进程和临时文件
         if: always()

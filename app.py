@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, random, requests, subprocess,ctypes
+import os, re, sys, time, random, json, requests, subprocess,ctypes
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
@@ -116,21 +116,65 @@ def diag_turnstile_dom(sb, errors=None):
             print("   [diag][exec-error] " + str(err)[:200])
 
 #  页面注入脚本
-# Turnstile token（官方 JS 接口 或 表单隐藏域），未通过时为空串
-TURNSTILE_TOKEN_JS = """
-try { if (window.turnstile && window.turnstile.getResponse) {
-        var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
-var el = document.querySelector('input[name="cf-turnstile-response"]');
-return el ? (el.value || '') : '';
+# 可见弹窗定位辅助（登录页没有弹窗时返回 null）
+DIALOG_HELPERS_JS = """
+function __shown(el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width < 8 && r.height < 8) return false;
+    var st = window.getComputedStyle(el);
+    if (!st) return false;
+    return st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
+}
+function __findDialog() {
+    var list = document.querySelectorAll('[role="dialog"], dialog[open], .modal.show, .modal.in');
+    var first = null;
+    for (var i = 0; i < list.length; i++) {
+        if (!__shown(list[i])) continue;
+        if (/renew/i.test(list[i].innerText || '')) return list[i];
+        if (!first) first = list[i];
+    }
+    if (first) return first;
+    var all = document.querySelectorAll('div');
+    var best = null;
+    for (var j = 0; j < all.length; j++) {
+        var st = window.getComputedStyle(all[j]);
+        if (!st) continue;
+        if (st.position !== 'fixed' || parseInt(st.zIndex || '0', 10) <= 100) continue;
+        var r = all[j].getBoundingClientRect();
+        if (r.width < 250 || r.height < 150 || !__shown(all[j])) continue;
+        if (/renew/i.test(all[j].innerText || '')) return all[j];
+        if (!best) best = all[j];
+    }
+    return best;
+}
 """
 
-TURNSTILE_EXISTS_JS = """
-return document.querySelector(
-    'input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile'
-) !== null;
+# Turnstile token：优先读取当前可见弹窗内的隐藏域，避免拿到其它 widget 的 token
+TURNSTILE_TOKEN_JS = DIALOG_HELPERS_JS + """
+var dlg = __findDialog();
+var el = dlg ? dlg.querySelector('input[name="cf-turnstile-response"]') : null;
+if (!el) el = document.querySelector('input[name="cf-turnstile-response"]');
+if (el && el.value) return el.value;
+try { if (window.turnstile && window.turnstile.getResponse) {
+        var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
+return '';
 """
-TS_COORDS_JS = """
+
+TURNSTILE_EXISTS_JS = DIALOG_HELPERS_JS + """
+function __hasTs(root) {
+    if (!root) return false;
+    return root.querySelector(
+        'input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile'
+    ) !== null;
+}
+var dlg = __findDialog();
+if (dlg && __hasTs(dlg)) return true;
+return __hasTs(document);
+"""
+TS_COORDS_JS = DIALOG_HELPERS_JS + """
 function findWidget(root) {
+    if (!root) return null;
     var els = root.querySelectorAll(
         'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [id*="cf-chl"]');
     for (var i = 0; i < els.length; i++) {
@@ -146,8 +190,9 @@ function findWidget(root) {
     }
     return null;
 }
-function boxFromTokenInput() {
-    var el = document.querySelector('input[name="cf-turnstile-response"]');
+function boxFromTokenInput(root) {
+    if (!root) return null;
+    var el = root.querySelector('input[name="cf-turnstile-response"]');
     var cur = el ? el.parentElement : null;
     for (var k = 0; k < 6 && cur; k++) {
         var r = cur.getBoundingClientRect();
@@ -156,10 +201,149 @@ function boxFromTokenInput() {
     }
     return null;
 }
-var hit = findWidget(document) || boxFromTokenInput();
+var dlg = __findDialog();
+var hit = findWidget(dlg) || boxFromTokenInput(dlg);
+if (!hit) hit = findWidget(document) || boxFromTokenInput(document);
 if (!hit) return null;
 var hr = hit.getBoundingClientRect();
 return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
+"""
+
+# 弹窗内按钮清单（文本/class/禁用状态/坐标），用于准确点击"Renew for 4 days"
+DIALOG_BUTTONS_JS = DIALOG_HELPERS_JS + """
+var dlg = __findDialog();
+var root = dlg || document;
+var out = {found: !!dlg, buttons: [], text: '', html: ''};
+out.text = (root.innerText || '').replace(/\\s+/g, ' ').slice(0, 500);
+out.html = dlg ? String(dlg.outerHTML || '').slice(0, 4000) : '';
+var els = root.querySelectorAll('button, [role="button"], a.btn');
+for (var i = 0; i < els.length; i++) {
+    var el = els[i], r = el.getBoundingClientRect();
+    var st = window.getComputedStyle(el);
+    var cls = String(el.className || '');
+    out.buttons.push({
+        text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80),
+        cls: cls.slice(0, 120),
+        disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+                     /\\bdisabled\\b/.test(cls) || st.pointerEvents === 'none' ||
+                     parseFloat(st.opacity || '1') < 0.5),
+        visible: __shown(el) && r.width > 20 && r.height > 10,
+        x: Math.round(r.x), y: Math.round(r.y),
+        w: Math.round(r.width), h: Math.round(r.height)
+    });
+}
+return JSON.stringify(out);
+"""
+
+# 滚动到确认按钮并返回最新坐标
+SCROLL_CONFIRM_BTN_JS = DIALOG_HELPERS_JS + """
+var dlg = __findDialog();
+var root = dlg || document;
+var els = root.querySelectorAll('button, [role="button"], a.btn');
+var target = null;
+for (var i = 0; i < els.length; i++) {
+    var t = (els[i].innerText || '').replace(/\\s+/g, ' ').trim();
+    if (!/renew/i.test(t)) continue;
+    if (/free\\s*plan/i.test(t)) continue;
+    if (/\\d+\\s*days?/i.test(t)) { target = els[i]; break; }
+    if (!dlg) continue;
+    if (!target && __shown(els[i])) target = els[i];
+}
+if (!target) return null;
+try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+var r = target.getBoundingClientRect();
+return {
+    x: Math.round(r.x), y: Math.round(r.y),
+    w: Math.round(r.width), h: Math.round(r.height),
+    text: (target.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80)
+};
+"""
+
+# 在页面内记录 fetch/XHR 的请求与响应，用于确认续期请求是否真的发出
+NET_CAPTURE_JS = """
+if (window.__renewNetInstalled) return 'installed';
+window.__renewNet = [];
+window.__renewNetInstalled = true;
+function __interesting(url) {
+    var s = String(url || '');
+    if (!s || /^data:|^blob:/i.test(s)) return false;
+    if (/\\.(png|jpe?g|gif|svg|webp|ico|css|woff2?|ttf)(\\?|$)/i.test(s)) return false;
+    if (/(google-analytics|googletagmanager|analytics\\.google|doubleclick|facebook\\.net|clarity\\.ms|hotjar|sentry\\.io)/i.test(s)) return false;
+    if (/(challenges\\.cloudflare\\.com|cdn-cgi\\/challenge-platform|cloudflareinsights)/i.test(s)) return false;
+    return true;
+}
+var __origFetch = window.fetch;
+if (__origFetch) {
+    window.fetch = function () {
+        var input = arguments[0], init = arguments[1] || {};
+        var url = (typeof input === 'string') ? input : (input && input.url) || '';
+        var method = String(init.method || (input && input.method) || 'GET').toUpperCase();
+        var p = __origFetch.apply(this, arguments);
+        if (method !== 'GET' && __interesting(url)) {
+            var entry = {kind: 'fetch', method: method, url: String(url), status: null, body: null, t: Date.now()};
+            window.__renewNet.push(entry);
+            try {
+                p.then(function (resp) {
+                    entry.status = resp.status;
+                    try { resp.clone().text().then(function (t) {
+                        entry.body = String(t || '').slice(0, 3000);
+                    }).catch(function () {}); } catch (e) {}
+                    return resp;
+                }).catch(function (err) { entry.error = String(err); });
+            } catch (e) {}
+        }
+        return p;
+    };
+}
+var __origOpen = XMLHttpRequest.prototype.open;
+var __origSend = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open = function (method, url) {
+    this.__netEntry = {kind: 'xhr', method: String(method || 'GET').toUpperCase(),
+                       url: String(url || ''), status: null, body: null, t: Date.now()};
+    return __origOpen.apply(this, arguments);
+};
+XMLHttpRequest.prototype.send = function () {
+    var self = this, entry = this.__netEntry;
+    if (entry && entry.method !== 'GET' && __interesting(entry.url)) {
+        window.__renewNet.push(entry);
+        this.addEventListener('load', function () {
+            entry.status = self.status;
+            try { entry.body = String(self.responseText || '').slice(0, 3000); } catch (e) {}
+        });
+        this.addEventListener('error', function () { entry.error = 'xhr error'; });
+    }
+    return __origSend.apply(this, arguments);
+};
+return 'installed';
+"""
+
+# 可见的 toast/alert 提示，便于发现"验证失败/已达到冷却"等服务端反馈
+FEEDBACK_JS = """
+var out = [];
+var els = document.querySelectorAll('[role="alert"], .alert, .toast, [class*="toast"], [class*="notification"]');
+for (var i = 0; i < els.length; i++) {
+    var r = els[i].getBoundingClientRect();
+    var st = window.getComputedStyle(els[i]);
+    if (r.width <= 0 || r.height <= 0 || st.display === 'none' || st.visibility === 'hidden') continue;
+    var t = (els[i].innerText || '').replace(/\\s+/g, ' ').trim();
+    if (t) out.push(t.slice(0, 200));
+}
+return out.join(' | ').slice(0, 500);
+"""
+
+# 只从 Free plan 卡片中提取文本，避免读到其它卡片的日期
+FREE_PLAN_TEXT_JS = """
+var all = document.querySelectorAll('div, section, article, li');
+var best = null;
+for (var i = 0; i < all.length; i++) {
+    var t = (all[i].innerText || '');
+    if (!/free\\s*plan/i.test(t)) continue;
+    if (!/(expir|renew)/i.test(t)) continue;
+    if (!/\\d{1,2}\\s+[A-Za-z]{3,9}\\s+\\d{4}|\\d{1,2}\\/\\d{1,2}\\/\\d{4}|\\d{4}-\\d{2}-\\d{2}/.test(t)) continue;
+    if (t.length > 1500) continue;
+    if (!best || t.length < ((best.innerText || '').length)) best = all[i];
+}
+return best ? best.innerText : '';
 """
 
 # Turnstile 脚本异步渲染，轮询等待组件出现
@@ -214,6 +398,25 @@ def _xdotool_click(x: int, y: int):
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
 
+def _screen_point(sb, cx, cy):
+    """把页面视口坐标换算成屏幕坐标（兼容 xvfb 下的浏览器窗口标题栏偏移）"""
+    wi = js(sb, "return '' + (window.screenX || 0) + '|' + (window.screenY || 0) + '|' +"
+                " window.outerHeight + '|' + window.innerHeight;", "")
+    parts = str(wi).split("|")
+    sx, sy = int(parts[0] or 0), int(parts[1] or 0)
+    bar = int(parts[2] or 800) - int(parts[3] or 768)
+    return int(cx) + sx, int(cy) + sy + bar
+
+def _click_viewport_point(sb, cx, cy, label="元素") -> bool:
+    try:
+        ax, ay = _screen_point(sb, cx, cy)
+        print(f"🖱️ 底层点击 {label} ({ax}, {ay})")
+        _xdotool_click(ax, ay)
+        return True
+    except Exception as e:
+        print(f"⚠️ 底层点击 {label} 失败: {e}")
+        return False
+
 def turnstile_token(sb) -> str:
     token = js(sb, TURNSTILE_TOKEN_JS, "")
     return token if isinstance(token, str) else ""
@@ -232,21 +435,10 @@ def _click_turnstile(sb, locate_timeout=10) -> bool:
         diag_turnstile_dom(sb, errors)
         return False
 
-    try:
-        wi = js(sb, "return '' + (window.screenX || 0) + '|' + (window.screenY || 0) + '|' +"
-                    " window.outerHeight + '|' + window.innerHeight;", "")
-        parts = str(wi).split("|")
-        sx, sy = int(parts[0] or 0), int(parts[1] or 0)
-        bar = int(parts[2] or 800) - int(parts[3] or 768)
-        ax = int(coords["cx"]) + sx
-        ay = int(coords["cy"]) + sy + bar
-        print(f"🖱️ 底层点击 Turnstile ({ax}, {ay})")
-        _xdotool_click(ax, ay)
+    if _click_viewport_point(sb, int(coords["cx"]), int(coords["cy"]), "Turnstile"):
         time.sleep(3)
         return True
-    except Exception as e:
-        print(f"⚠️ 底层点击失败: {e}")
-        return False
+    return False
 
 def click_turnstile(sb) -> bool:
     if _click_turnstile(sb):
@@ -304,18 +496,19 @@ def get_current_ip(proxy_server: str = "") -> str:
     response.raise_for_status()
     return response.text.strip()
 
-# 时间格式化
+# 时间格式化（兼容 HH:MM:SS、HH:MM 和 "3d 4h 5m" 等写法）
 def format_countdown(countdown_str: str) -> str:
-    try:
-        h, m, _ = countdown_str.split(':')
-        h = int(h)
-        m = int(m)
-        if h > 0:
-            return f"{h}h{m}min"
-        else:
-            return f"{m}min"
-    except:
-        return countdown_str
+    if not countdown_str:
+        return ""
+    text = re.sub(r"\s+", " ", str(countdown_str)).strip()
+    if ":" in text and not re.search(r"[dhms]", text, re.I):
+        try:
+            parts = text.split(":")
+            h, m = int(parts[0]), int(parts[1])
+            return f"{h}h{m}min" if h > 0 else f"{m}min"
+        except Exception:
+            return text
+    return text
 
 # 归一化日期为 YYYY/MM/DD
 def normalize_date(date_str: str) -> str:
@@ -327,10 +520,20 @@ def normalize_date(date_str: str) -> str:
             return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
     return date_str
 
-DATE_RE = r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
-
-# 获取过期日期
+# 日期格式：14 Nov 2026 / 14/11/2026 / 2026-11-14
 DATE_RE = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})"
+
+# 续期冷却倒计时，兼容 "Renew in 3d 4h 5m" 和 "Renew in 00:23:59"
+COUNTDOWN_RE = re.compile(
+    r"(?:Renewal cooldown|Renew in|Renewable in|Next renew in)\s*[:\-]?\s*"
+    r"((?:\d+\s*[dhms]\s*)+|\d{1,3}:\d{2}(?::\d{2})?)",
+    re.I,
+)
+
+def extract_countdown(text: str) -> str:
+    match = COUNTDOWN_RE.search(text or "")
+    return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
         r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE,   # 优先匹配包含 "Expires" 的
@@ -345,8 +548,15 @@ def extract_expiry_date(page_source: str) -> str:
             
     return None
 
-# 优先从 DOM 的 st-meta 元素提取到期日期 (不依赖页面语言)
+# 优先从 Free plan 卡片提取到期日期，避免读到其它卡片的日期
 def get_expiry_from_dom(sb) -> str:
+    try:
+        free_plan_text = str(js(sb, FREE_PLAN_TEXT_JS, "") or "")
+        match = re.search(DATE_RE, free_plan_text)
+        if match:
+            return normalize_date(match.group(1))
+    except Exception:
+        pass
     for selector in ['span.st-meta', '.st-meta', '[class*="st-meta"]']:
         try:
             if sb.is_element_present(selector):
@@ -357,12 +567,14 @@ def get_expiry_from_dom(sb) -> str:
             pass
     return None
 
-# 点击确认后轮询账单页，确认续期是否真的生效（只返回成功或失败，不再输出“可能未成功”）
+# 点击确认后轮询账单页，确认续期是否真的生效
 # 返回 (是否成功, 最新到期日, 冷却倒计时, 说明)
 def confirm_renewal_result(sb, current_expiry: str, timeout: int = 60) -> tuple:
     deadline = time.time() + timeout
     last_expiry = current_expiry
+    rounds = 0
     while True:
+        rounds += 1
         sb.sleep(3)
         try:
             # 带时间戳重新打开账单页，避开前端缓存
@@ -378,14 +590,331 @@ def confirm_renewal_result(sb, current_expiry: str, timeout: int = 60) -> tuple:
         latest = get_expiry_from_dom(sb) or extract_expiry_date(text)
         if latest:
             last_expiry = latest
-        match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", text)
-        if match:
-            return True, last_expiry, match.group(1), "账单页已出现下次可续期倒计时"
+        countdown = extract_countdown(text)
+        print(f"🔎 第 {rounds} 次核对: 到期日={last_expiry or '未知'} 倒计时={countdown or '无'}")
+        if countdown:
+            return True, last_expiry, countdown, "账单页已出现下次可续期倒计时"
         if current_expiry and latest and latest != current_expiry:
             return True, last_expiry, "", f"到期时间已更新（{current_expiry} → {latest}）"
         if time.time() >= deadline:
             return False, last_expiry, "", f"{timeout} 秒内账单页未出现续期倒计时，到期时间也未变化"
-        sb.sleep(4)
+        sb.sleep(3)
+
+# ---------- 续期弹窗与网络诊断 ----------
+def get_dialog_state(sb) -> dict:
+    raw = js(sb, DIALOG_BUTTONS_JS, "{}")
+    try:
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def wait_dialog(sb, timeout: int = 30) -> dict:
+    deadline = time.time() + timeout
+    state = {}
+    while time.time() < deadline:
+        state = get_dialog_state(sb)
+        # 弹窗结构识别失败时，只要页面上出现了续期确认按钮也算弹窗已就绪
+        if state.get("found") or pick_renew_confirm_button(state):
+            return state
+        time.sleep(1)
+    return state
+
+def pick_renew_confirm_button(state: dict):
+    """在弹窗按钮里挑选续期确认按钮（排除入口按钮 Renew free plan）"""
+    candidates = []
+    for btn in state.get("buttons", []):
+        text = (btn.get("text") or "").strip()
+        if not btn.get("visible") or not text:
+            continue
+        if not re.search(r"renew", text, re.I):
+            continue
+        if re.search(r"free\s*plan", text, re.I):
+            continue
+        # 没识别到弹窗时，只接受带天数的按钮，避免误点页面上的其它 Renew 入口
+        if not state.get("found") and not re.search(r"\d+\s*days?", text, re.I):
+            continue
+        candidates.append(btn)
+    for btn in candidates:
+        if re.search(r"\d+\s*days?", btn["text"], re.I):
+            return btn
+    return candidates[0] if candidates else None
+
+def print_dialog_state(state: dict, tag: str = "弹窗"):
+    buttons = state.get("buttons") or []
+    print(f"🧭 {tag}按钮清单({len(buttons)}个):")
+    for btn in buttons:
+        print(f"   - '{btn.get('text')}' class='{btn.get('cls')}' disabled={btn.get('disabled')} "
+              f"visible={btn.get('visible')} rect=({btn.get('x')},{btn.get('y')},"
+              f"{btn.get('w')}x{btn.get('h')})")
+
+def wait_renew_confirm_enabled(sb, timeout: int = 30):
+    """等待弹窗确认按钮出现且可点击（Turnstile 通过后按钮才启用）"""
+    deadline = time.time() + timeout
+    state = get_dialog_state(sb)
+    while time.time() < deadline:
+        state = get_dialog_state(sb)
+        btn = pick_renew_confirm_button(state)
+        if btn and not btn.get("disabled") and btn.get("w", 0) > 40 and btn.get("h", 0) > 15:
+            return btn, state
+        time.sleep(1)
+    return None, state
+
+def install_net_capture(sb):
+    try:
+        result = js(sb, NET_CAPTURE_JS, "")
+        print(f"📡 页面网络记录已就绪: {result or 'unknown'}")
+    except Exception as e:
+        print(f"⚠️ 启用网络记录失败: {e}")
+
+def read_net_log(sb) -> list:
+    raw = js(sb, "return JSON.stringify(window.__renewNet || []);", "[]")
+    try:
+        data = json.loads(raw or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def print_net_entries(entries: list, tag: str = "续期请求"):
+    if not entries:
+        print(f"📡 {tag}: 未捕获到任何非 GET 请求")
+        return
+    print(f"📡 {tag}({len(entries)}条):")
+    for entry in entries[-20:]:
+        print(f"   - [{entry.get('kind')}] {entry.get('method')} {entry.get('url')} "
+              f"-> {entry.get('status')} body={(entry.get('body') or '')[:400]}")
+        if entry.get("error"):
+            print(f"     error={entry.get('error')}")
+
+def wait_renew_request(sb, since: int = 0, timeout: int = 45, require_status: bool = True):
+    """等待点击确认后的非 GET 请求；require_status=False 时只要请求已发出就算命中"""
+    deadline = time.time() + timeout
+    data = []
+    while time.time() < deadline:
+        data = read_net_log(sb)
+        for entry in data[since:]:
+            if not entry.get("url"):
+                continue
+            if not require_status:
+                return True, data
+            if entry.get("status") is not None:
+                time.sleep(1)  # 等响应体异步读取完成
+                return True, read_net_log(sb)
+        time.sleep(1)
+    return False, read_net_log(sb)
+
+def get_visible_feedback(sb) -> str:
+    return str(js(sb, FEEDBACK_JS, "") or "")
+
+def looks_like_success_response(status, body: str) -> bool:
+    try:
+        code = int(status)
+    except Exception:
+        return False
+    if not (200 <= code < 300):
+        return False
+    text = (body or "").lower()
+    if re.search(r'"(success|ok)"\s*:\s*(false|"false")', text):
+        return False
+    if re.search(r'"(error|errors)"\s*:', text):
+        return False
+    if re.search(r"\b(error|failed|invalid|forbidden|expired|denied|cooldown|too many)\b", text):
+        return False
+    if re.search(r"<title>\s*(login|sign in)", text):
+        return False
+    return True
+
+def find_outer_renew_button(sb):
+    """返回 (状态, 按钮文本, selector)；状态为 ready / cooldown / None"""
+    possible_selectors = [
+        'type:button("Renew free plan")',
+        'button:contains("Renew free plan")',
+        'button:contains("Renew")',
+        '[class*="btn btn-primary btn-sm"]',
+    ]
+    for selector in possible_selectors:
+        try:
+            if not sb.is_element_visible(selector):
+                continue
+            button_text = sb.get_text(selector)
+            if extract_countdown(button_text):
+                return "cooldown", button_text, selector
+            if re.search(r"renew", button_text, re.I):
+                return "ready", button_text, selector
+        except Exception:
+            continue
+    return None, None, None
+
+def attempt_renewal(sb, current_expiry: str) -> dict:
+    """执行一次续期：点入口按钮 -> 过 Turnstile -> 点确认 -> 等请求 -> 复核结果"""
+    state, button_text, selector = find_outer_renew_button(sb)
+    if state == "cooldown":
+        countdown = extract_countdown(button_text)
+        print(f"✅ 当前已处于续期冷却: '{button_text}'")
+        return {"ok": True, "expiry": current_expiry, "countdown": countdown,
+                "reason": f"账单页已显示冷却倒计时（{button_text}）"}
+    if state != "ready":
+        return {"ok": False, "expiry": current_expiry, "countdown": "",
+                "reason": "未找到可用的续期按钮或倒计时"}
+
+    print(f"🔄 点击外部续期按钮: '{button_text}'")
+    try:
+        sb.sleep(2)
+        sb.click(selector)
+    except Exception as e:
+        return {"ok": False, "expiry": current_expiry, "countdown": "",
+                "reason": f"点击外部续期按钮失败: {e}"}
+
+    dialog = wait_dialog(sb, timeout=30)
+    if not dialog.get("found") and not pick_renew_confirm_button(dialog):
+        feedback = get_visible_feedback(sb)
+        print(f"💬 页面提示: {feedback or '（无）'}")
+        return {"ok": False, "expiry": current_expiry, "countdown": "",
+                "reason": "点击续期按钮后未出现续期弹窗", "evidence": {"feedback": feedback}}
+    print(f"🧾 续期弹窗已出现: {dialog.get('text', '')[:160]}")
+    print_dialog_state(dialog)
+
+    turnstile_passed = True
+    if wait_turnstile_present(sb, timeout=40):
+        turnstile_passed = handle_turnstile(sb)
+        if not turnstile_passed:
+            print("❌ 弹窗 Turnstile 验证失败，尝试兜底点击...")
+            try:
+                sb.cdp.click_captcha()
+                sb.sleep(4)
+                turnstile_passed = bool(turnstile_token(sb))
+            except Exception as e:
+                print(f"⚠️ 兜底点击失败: {e}")
+    else:
+        print("ℹ️ 弹窗内未检测到 Turnstile")
+
+    if not turnstile_passed:
+        feedback = get_visible_feedback(sb)
+        print(f"💬 页面提示: {feedback or '（无）'}")
+        return {"ok": False, "expiry": current_expiry, "countdown": "",
+                "reason": "Turnstile 验证未通过", "evidence": {"feedback": feedback}}
+
+    print("⏳ 等待弹窗确认按钮变为可用...")
+    confirm_btn, latest_state = wait_renew_confirm_enabled(sb, timeout=30)
+    print_dialog_state(latest_state, "等待后")
+    if not confirm_btn:
+        feedback = get_visible_feedback(sb)
+        print("⚠️ 未找到可用的续期确认按钮，弹窗 HTML 片段：")
+        print(str(latest_state.get("html", ""))[:3000])
+        print(f"💬 页面提示: {feedback or '（无）'}")
+        return {"ok": False, "expiry": current_expiry, "countdown": "",
+                "reason": "弹窗内未找到可用的续期确认按钮",
+                "evidence": {"feedback": feedback, "dialog_html": latest_state.get("html", "")}}
+
+    mark = int(js(sb, "window.__renewMark = (window.__renewNet || []).length; "
+                      "return window.__renewMark;", 0) or 0)
+
+    point = js(sb, SCROLL_CONFIRM_BTN_JS, None)
+    clicked = False
+    if point and point.get("w", 0) > 0:
+        cx = int(point["x"] + point["w"] / 2)
+        cy = int(point["y"] + point["h"] / 2)
+        print(f"🖱️ 点击续期确认按钮 '{point.get('text')}' ({cx}, {cy})")
+        clicked = _click_viewport_point(sb, cx, cy, "续期确认按钮")
+    if not clicked:
+        try:
+            sb.click('div[role="dialog"] button.btn-primary', timeout=5)
+            clicked = True
+            print("✅ 已兜底点击续期确认按钮")
+        except Exception as e:
+            print(f"⚠️ 兜底点击续期确认按钮失败: {e}")
+
+    if not clicked:
+        return {"ok": False, "expiry": current_expiry, "countdown": "",
+                "reason": "未能点击弹窗确认按钮"}
+
+    # 先用短超时确认请求是否真的发出，没发出说明点击未生效，再补一次 SeleniumBase 点击
+    fired, net = wait_renew_request(sb, since=mark, timeout=12, require_status=False)
+    if not fired:
+        feedback = get_visible_feedback(sb)
+        print(f"⚠️ 首次点击后 12 秒内未发出任何续期请求，页面提示: {feedback or '（无）'}")
+        print("🖱️ 尝试用 SeleniumBase 再点一次确认按钮...")
+        try:
+            sb.click('div[role="dialog"] button.btn-primary', timeout=5)
+        except Exception as e:
+            print(f"⚠️ 二次点击失败: {e}")
+        fired, net = wait_renew_request(sb, since=mark, timeout=15, require_status=False)
+
+    print("⏳ 等待续期请求返回（最多 45 秒）...")
+    captured, net = wait_renew_request(sb, since=mark, timeout=45)
+    candidates = net[mark:]
+    print_net_entries(candidates)
+    feedback = get_visible_feedback(sb)
+    if feedback:
+        print(f"💬 点击后页面提示: {feedback}")
+    dialog_after = get_dialog_state(sb)
+    print(f"🧭 点击后弹窗状态: {'仍显示' if dialog_after.get('found') else '已关闭'}")
+
+    req_status = None
+    req_body = ""
+    # 优先看续期/订阅相关接口，找不到再退回站点内任意请求，避免把其它 API 当成续期结果
+    ordered = [e for e in candidates
+               if re.search(r"renew|subscription|billing|plan|checkout",
+                            str(e.get("url") or ""), re.I)] + candidates
+    for entry in ordered:
+        url = str(entry.get("url") or "")
+        if entry.get("status") is not None and ("bot-hosting" in url or url.startswith("/")):
+            req_status = entry.get("status")
+            req_body = str(entry.get("body") or "")
+    api_success = looks_like_success_response(req_status, req_body)
+    evidence = {
+        "net": candidates,
+        "feedback": feedback,
+        "dialog_closed": not dialog_after.get("found"),
+        "req_status": req_status,
+        "req_body": req_body[:1000],
+    }
+
+    sb.sleep(2)
+    ok, new_expiry, countdown, reason = confirm_renewal_result(sb, current_expiry, timeout=60)
+    if ok:
+        return {"ok": True, "expiry": new_expiry, "countdown": countdown,
+                "reason": reason, "evidence": evidence}
+    if api_success:
+        return {"ok": True, "expiry": new_expiry or current_expiry, "countdown": "",
+                "reason": f"续期接口返回 HTTP {req_status}，服务端已接受", "evidence": evidence}
+    if req_status:
+        return {"ok": False, "expiry": new_expiry, "countdown": "",
+                "reason": f"续期请求返回 HTTP {req_status}: {req_body[:200]}", "evidence": evidence}
+    if captured or fired:
+        return {"ok": False, "expiry": new_expiry, "countdown": "",
+                "reason": "已发出请求但未拿到有效响应，结果未知", "evidence": evidence}
+    return {"ok": False, "expiry": new_expiry, "countdown": "",
+            "reason": "点击确认按钮后未捕获到续期请求（按钮未真正提交或被前端拦截）",
+            "evidence": evidence}
+
+def save_debug_artifacts(sb, tag: str, evidence=None):
+    """失败时保存截图、页面 HTML 和网络证据，便于排查"""
+    png_path = f"renew_debug_{tag}.png"
+    try:
+        sb.driver.save_screenshot(png_path)
+        print(f"📸 已保存现场截图: {png_path}")
+    except Exception as e:
+        try:
+            sb.save_screenshot(png_path)
+            print(f"📸 已保存现场截图: {png_path}")
+        except Exception as e2:
+            print(f"⚠️ 保存截图失败: {e} / {e2}")
+    try:
+        html_path = f"renew_debug_{tag}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(sb.get_page_source())
+        print(f"📄 已保存页面 HTML: {html_path}")
+    except Exception as e:
+        print(f"⚠️ 保存 HTML 失败: {e}")
+    if evidence:
+        try:
+            net_path = f"renew_debug_{tag}_net.json"
+            with open(net_path, "w", encoding="utf-8") as f:
+                json.dump(evidence, f, ensure_ascii=False, indent=2)
+            print(f"📡 已保存网络与提示证据: {net_path}")
+        except Exception as e:
+            print(f"⚠️ 保存网络证据失败: {e}")
 
 # 主流程
 def main():
@@ -478,140 +1007,49 @@ def main():
         else:
             print("⚠️ 未能提取当前到期日期")
 
-        # 寻找外部续期按钮
-        outer_renew_selector = None
-        countdown_text = None
-        possible_selectors = [
-            'type:button("Renew free plan")',
-            'button:contains("Renew free plan")',
-            '[class*="btn btn-primary btn-sm"]',
-        ]
+        # 续期：定位入口按钮 -> 过 Turnstile -> 点确认 -> 等待请求 -> 复核结果，失败自动重试一次
+        result = None
+        for attempt in range(1, 3):
+            if attempt > 1:
+                print("🔁 重新加载账单页后重试续期...")
+                try:
+                    sb.open(f"{BASE_URL}/dash/billings?_r={int(time.time())}")
+                    sb.wait_for_ready_state_complete()
+                    sb.sleep(3)
+                except Exception as e:
+                    print(f"⚠️ 重载账单页失败: {e}")
+                    break
+            install_net_capture(sb)
+            result = attempt_renewal(sb, current_expiry)
+            if result.get("ok"):
+                break
+            print(f"⚠️ 第 {attempt} 次续期未成功: {result.get('reason')}")
+            save_debug_artifacts(sb, f"attempt{attempt}", result.get("evidence"))
 
-        for selector in possible_selectors:
-            try:
-                if sb.is_element_visible(selector):
-                    button_text = sb.get_text(selector)
-                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" 都表示冷却中, 时间为距可续期的剩余时长
-                    match = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", button_text, re.I)
-                    if match:
-                        countdown_text = match.group(1)
-                        print(f"⏳ 续期冷却中, 未到续期时间: '{button_text}'")
-                        break
-                    elif "Renew" in button_text:
-                        outer_renew_selector = selector
-                        print(f"✅ 续期按钮可用: '{button_text}'")
-                        break
-            except Exception as e:
-                pass
-
-        # 点击外部续期按钮等待弹窗
-        if outer_renew_selector:
-            print("🔄 点击外部续期按钮，等待验证窗口...")
-            try:
-                sb.sleep(2)
-                sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
-            except Exception as e:
-                print(f"❌ 点击外部按钮失败: {e}")
-                send_moviepilot_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
-                return
-
-            # 处理弹窗中的 Turnstile
-            turnstile_passed = True  # 未检测到 Turnstile 时视为无需验证
-            if wait_turnstile_present(sb):
-                turnstile_passed = handle_turnstile(sb)
-                if not turnstile_passed:
-                    print("❌ Turnstile 验证失败，尝试兜底点击...")
-                    try:
-                        sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
-                        sb.sleep(4)
-                        turnstile_passed = bool(turnstile_token(sb))
-                    except Exception as e:
-                        print(f"⚠️ 兜底点击失败: {e}")
-                    # sb.save_screenshot("turnstile_failed.png")
-            else:
-                print("ℹ️ 未检测到 Turnstile")
-
-            if not turnstile_passed:
-                print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_moviepilot_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                return
-
-            # 点击续期按钮
-            print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
-
-            modal_button_clicked = False
-            try:
-                selector = 'div[role="dialog"] button.btn-primary' 
-                sb.click(selector, timeout=8)
-                modal_button_clicked = True
-                print("✅ 已点击续期按钮")
-            except Exception as e:
-                print(f"续期按钮点击失败: {e}")
-
-            if not modal_button_clicked:
-                print("❌ 未点击到弹窗确认按钮，判定续期失败")
-                send_moviepilot_message(
-                    format_notification(
-                        "❌ 续期失败",
-                        error="未点击到弹窗确认按钮",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
+        if result and result.get("ok"):
+            new_expiry = result.get("expiry") or current_expiry
+            new_countdown = result.get("countdown") or ""
+            reason = result.get("reason") or "续期成功"
+            print(f"✅ 续期成功（{reason}）")
+            extra = f"⏱️ 可续期时间: {format_countdown(new_countdown)}后" if new_countdown else reason
+            send_moviepilot_message(
+                format_notification(
+                    "✅ 续期成功",
+                    extra=extra,
+                    expiry_date=new_expiry or "（未获取到）"
                 )
-                return
-
-            print("⏳ 等待新的过期时间...")
-            sb.sleep(5)
-            sb.refresh()
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-
-            renew_ok, new_expiry, new_countdown, reason = confirm_renewal_result(sb, current_expiry)
-            if renew_ok:
-                print(f"✅ 续期成功（{reason}）")
-                if new_countdown:
-                    extra = f"⏱️ 可续期时间: {format_countdown(new_countdown)}后"
-                else:
-                    extra = reason
-                send_moviepilot_message(
-                    format_notification(
-                        "✅ 续期成功",
-                        extra=extra,
-                        expiry_date=new_expiry or "（未获取到）"
-                    )
-                )
-            else:
-                print(f"❌ 续期失败（{reason}）")
-                send_moviepilot_message(
-                    format_notification(
-                        "❌ 续期失败",
-                        error=reason,
-                        expiry_date=new_expiry or "（未获取到）"
-                    )
-                )
-
+            )
         else:
-            if countdown_text:
-                friendly = format_countdown(countdown_text)
-                # 冷却中说明本期已经续期过，按成功告知
-                print(f"✅ 本期已续期（冷却中，{friendly} 后可再次续期）")
-                send_moviepilot_message(
-                    format_notification(
-                        "✅ 续期成功",
-                        extra=f"本期已续期，{friendly}后可再次续期",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
+            reason = (result or {}).get("reason") or "续期失败"
+            new_expiry = (result or {}).get("expiry") or current_expiry
+            print(f"❌ 续期失败（{reason}）")
+            send_moviepilot_message(
+                format_notification(
+                    "❌ 续期失败",
+                    error=reason,
+                    expiry_date=new_expiry or "（未获取到）"
                 )
-            else:
-                print("❌ 未找到续期按钮或倒计时，判定续期失败")
-                send_moviepilot_message(
-                    format_notification(
-                        "❌ 续期失败",
-                        error="未找到续期按钮，请检查账号状态或页面结构",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
-                )
+            )
 
         print("🏁 脚本执行完毕")
 
